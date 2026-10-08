@@ -81,6 +81,21 @@ def reconcile_financial_data(financial_data):
         ta = y_data.get("Total_Assets")
         liab = y_data.get("Total_Liabilities")
         eq = y_data.get("Equity")
+        cl = y_data.get("Current_Liabilities")
+        ncl = y_data.get("Non_Current_Liabilities", 0.0) or 0.0
+        
+        # Nếu Nợ phải trả trống nhưng có Nợ ngắn hạn
+        if (liab is None or pd.isna(liab) or liab == 0) and cl is not None and not pd.isna(cl) and cl > 0:
+            liab = cl + ncl
+            y_data["Total_Liabilities"] = liab
+
+        # Kiểm tra nếu Tổng tài sản bị OCR đọc nhầm mã số nhỏ (ví dụ < 1 tỷ trong khi Nợ + Vốn > 100 tỷ)
+        if liab is not None and eq is not None and not pd.isna(liab) and not pd.isna(eq) and (liab + eq) > 1e9:
+            if ta is None or pd.isna(ta) or ta < 1e8 or abs(ta - (liab + eq)) > max(ta, liab + eq) * 0.5:
+                # Ưu tiên cân đối Tổng tài sản = Nợ + Vốn
+                ta = liab + eq
+                y_data["Total_Assets"] = ta
+
         if ta is not None and not pd.isna(ta) and ta > 0:
             if (liab is None or pd.isna(liab) or liab == 0) and (eq is not None and not pd.isna(eq) and eq > 0):
                 y_data["Total_Liabilities"] = ta - eq
@@ -4067,6 +4082,15 @@ elif uploaded_files:
             """)
             
 if extracted_data:
+    # Áp dụng các số liệu hiệu chỉnh thủ công từ người dùng (nếu có)
+    if "manual_overrides" in st.session_state and st.session_state["manual_overrides"]:
+        for oy, o_dict in st.session_state["manual_overrides"].items():
+            if oy in extracted_data:
+                for ovar, oval in o_dict.items():
+                    if oval is not None:
+                        extracted_data[oy][ovar] = oval
+    extracted_data = reconcile_financial_data(extracted_data)
+
     # Lưu các thông tin phát hiện được vào session state phục vụ cho việc tải tham số EWS trực tuyến
     if tickers_detected:
         st.session_state["detected_ticker"] = list(tickers_detected)[0]
@@ -5206,8 +5230,92 @@ if extracted_data:
         st.markdown(table_html, unsafe_allow_html=True)
         st.info("💡 **Ghi chú chuẩn mực kế toán (TT 200)**: Đối với các doanh nghiệp thuộc ngành **Xây dựng, Xây lắp công trình, Thi công hạ tầng hoặc Sản xuất B2B** (như ALVICO), dòng **Chi phí bán hàng (Mã 25)** trên Báo cáo kết quả hoạt động kinh doanh đã kiểm toán thường **không phát sinh (= 0 đ)**, do toàn bộ chi phí nhân công, máy móc và quản lý dự án được hạch toán trực tiếp vào **Giá vốn hàng bán (Mã 11)** và **Chi phí quản lý doanh nghiệp (Mã 26)**.")
 
+        st.markdown("---")
+        with st.expander("✍️ **Hiệu chỉnh / Chỉnh sửa Số liệu Kế toán BCTC Thủ công & Tự động Cân đối**", expanded=True):
+            st.markdown("Chuyên viên thẩm định có thể chỉnh sửa các chỉ tiêu kế toán bị OCR đọc nhầm/mờ và bấm **Lưu** để cập nhật lại toàn bộ điểm số EWS.")
+            
+            c_btn1, c_btn2 = st.columns([1, 1])
+            with c_btn1:
+                if st.button("⚡ Tự động Cân đối Toàn bộ Các Năm (Tổng TS = Nợ + Vốn CSH)", type="primary", use_container_width=True):
+                    if "manual_overrides" not in st.session_state:
+                        st.session_state["manual_overrides"] = {}
+                    for y_item in years_list:
+                        y_d = extracted_data[y_item]
+                        l_v = float(y_d.get("Total_Liabilities", 0.0) or (y_d.get("Current_Liabilities", 0.0) or 0.0) + (y_d.get("Non_Current_Liabilities", 0.0) or 0.0))
+                        e_v = float(y_d.get("Equity", 0.0) or 0.0)
+                        if (l_v + e_v) > 0:
+                            if y_item not in st.session_state["manual_overrides"]:
+                                st.session_state["manual_overrides"][y_item] = {}
+                            st.session_state["manual_overrides"][y_item]["Total_Assets"] = l_v + e_v
+                            st.session_state["manual_overrides"][y_item]["Total_Liabilities"] = l_v
+                    st.success("✅ Đã tự động cân đối Tổng tài sản = Nợ phải trả + Vốn CSH cho tất cả các năm!")
+                    st.rerun()
+            with c_btn2:
+                if st.button("🔄 Khôi phục Số liệu Gốc Ban đầu", use_container_width=True):
+                    st.session_state["manual_overrides"] = {}
+                    st.info("Đã khôi phục toàn bộ số liệu trích xuất ban đầu.")
+                    st.rerun()
+                    
+            st.markdown("##### 📝 Chỉnh sửa chi tiết theo từng năm:")
+            edit_year = st.selectbox("Chọn năm cần hiệu chỉnh:", years_list, key="edit_year_tab7")
+            curr_y_data = extracted_data.get(edit_year, {})
+            
+            e_col1, e_col2, e_col3 = st.columns(3)
+            with e_col1:
+                st.markdown("**Bảng Cân đối Kế toán (Tài sản):**")
+                edit_ta = st.number_input("Tổng tài sản [270]", value=float(curr_y_data.get("Total_Assets", 0.0) or 0.0), format="%.0f", key=f"e_ta_{edit_year}")
+                edit_ca = st.number_input("Tài sản ngắn hạn [100]", value=float(curr_y_data.get("Current_Assets", 0.0) or 0.0), format="%.0f", key=f"e_ca_{edit_year}")
+                edit_fa = st.number_input("Tài sản dài hạn / TSCĐ [200]", value=float(curr_y_data.get("Fixed_Assets", 0.0) or 0.0), format="%.0f", key=f"e_fa_{edit_year}")
+                edit_cash = st.number_input("Tiền & tương đương tiền [110]", value=float(curr_y_data.get("Cash_Equivalents", 0.0) or 0.0), format="%.0f", key=f"e_cash_{edit_year}")
+                edit_rec = st.number_input("Phải thu ngắn hạn [130]", value=float(curr_y_data.get("Accounts_Receivable", 0.0) or 0.0), format="%.0f", key=f"e_rec_{edit_year}")
+                edit_inv = st.number_input("Hàng tồn kho [140]", value=float(curr_y_data.get("Inventories", 0.0) or 0.0), format="%.0f", key=f"e_inv_{edit_year}")
+                
+            with e_col2:
+                st.markdown("**Nguồn vốn & Nợ:**")
+                edit_liab = st.number_input("Nợ phải trả [300]", value=float(curr_y_data.get("Total_Liabilities", 0.0) or 0.0), format="%.0f", key=f"e_liab_{edit_year}")
+                edit_cl = st.number_input("Nợ ngắn hạn [310]", value=float(curr_y_data.get("Current_Liabilities", 0.0) or 0.0), format="%.0f", key=f"e_cl_{edit_year}")
+                edit_eq = st.number_input("Vốn chủ sở hữu [400]", value=float(curr_y_data.get("Equity", 0.0) or 0.0), format="%.0f", key=f"e_eq_{edit_year}")
+                edit_re = st.number_input("Lợi nhuận chưa phân phối [421]", value=float(curr_y_data.get("Retained_Earnings", 0.0) or 0.0), format="%.0f", key=f"e_re_{edit_year}")
+                edit_borrow = st.number_input("Vay & nợ thuê TC ngắn hạn [320]", value=float(curr_y_data.get("Short_Term_Borrowings", 0.0) or 0.0), format="%.0f", key=f"e_borrow_{edit_year}")
+                
+            with e_col3:
+                st.markdown("**Kết quả Kinh doanh & Dòng tiền:**")
+                edit_sales = st.number_input("Doanh thu thuần [10]", value=float(curr_y_data.get("Net_Sales", 0.0) or 0.0), format="%.0f", key=f"e_sales_{edit_year}")
+                edit_cogs = st.number_input("Giá vốn hàng bán [11]", value=float(curr_y_data.get("COGS", 0.0) or 0.0), format="%.0f", key=f"e_cogs_{edit_year}")
+                edit_gp = st.number_input("Lợi nhuận gộp [20]", value=float(curr_y_data.get("Gross_Profit", 0.0) or 0.0), format="%.0f", key=f"e_gp_{edit_year}")
+                edit_ebt = st.number_input("Lợi nhuận trước thuế EBT [50]", value=float(curr_y_data.get("EBT", 0.0) or 0.0), format="%.0f", key=f"e_ebt_{edit_year}")
+                edit_ni = st.number_input("Lợi nhuận sau thuế [60]", value=float(curr_y_data.get("Net_Income", 0.0) or 0.0), format="%.0f", key=f"e_ni_{edit_year}")
+                edit_ocf = st.number_input("Lưu chuyển tiền từ HĐKD [20 - LCTT]", value=float(curr_y_data.get("OCF", 0.0) or 0.0), format="%.0f", key=f"e_ocf_{edit_year}")
 
-    # ------------------ TAB 3: FORMULAS AND CALCULATIONS ------------------
+            if st.button(f"💾 Lưu số liệu chỉnh sửa Năm {edit_year} & Tính lại Toàn bộ EWS", type="primary"):
+                if "manual_overrides" not in st.session_state:
+                    st.session_state["manual_overrides"] = {}
+                if edit_year not in st.session_state["manual_overrides"]:
+                    st.session_state["manual_overrides"][edit_year] = {}
+                st.session_state["manual_overrides"][edit_year].update({
+                    "Total_Assets": edit_ta,
+                    "Current_Assets": edit_ca,
+                    "Fixed_Assets": edit_fa,
+                    "Cash_Equivalents": edit_cash,
+                    "Accounts_Receivable": edit_rec,
+                    "Inventories": edit_inv,
+                    "Total_Liabilities": edit_liab,
+                    "Current_Liabilities": edit_cl,
+                    "Equity": edit_eq,
+                    "Retained_Earnings": edit_re,
+                    "Short_Term_Borrowings": edit_borrow,
+                    "Net_Sales": edit_sales,
+                    "COGS": edit_cogs,
+                    "Gross_Profit": edit_gp,
+                    "EBT": edit_ebt,
+                    "Net_Income": edit_ni,
+                    "OCF": edit_ocf
+                })
+                st.success(f"✅ Đã lưu chỉnh sửa số liệu năm {edit_year} thành công!")
+                st.rerun()
+
+
+    # ------------------ TAB 8: FORMULAS AND CALCULATIONS ------------------
     with tab_formulas:
         st.subheader("Chi tiết số liệu trung gian & Công thức tính toán của 10 Chỉ số EWS")
         
