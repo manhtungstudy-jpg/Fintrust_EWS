@@ -1,0 +1,15 @@
+version: '3.8'
+
+services:
+  ews-app:
+    build: .
+    container_name: fintrust_ews_container
+    ports:
+      - "8501:8501"
+    environment:
+      # Truyền đường dẫn lưu dữ liệu bền vững bên trong container
+      - FINTRUST_EXE_DIR=/app/data
+    volumes:
+      # Gắn kết thư mục data trên máy chủ/máy cá nhân vào container để lưu trữ database và cache vĩnh viễn
+      - ./data:/app/data
+    restart: unless-stopped

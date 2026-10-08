@@ -1,0 +1,89 @@
+{
+    "auto_update_enabled": true,
+    "interval_days": 90,
+    "last_run": "2026-08-22 08:34:27",
+    "next_run": "2026-11-20 08:34:27",
+    "auto_apply_thresholds": true,
+    "last_status": "Thành công",
+    "last_error": null,
+    "last_summary": {
+        "Basic Materials (Nguyên vật liệu)": {
+            "n_samples": 188,
+            "optimal_leverage": null,
+            "r_squared": 0.5879,
+            "adj_r_squared": 0.5835,
+            "p_value_b2": 0.0,
+            "b0": 6.0908,
+            "b1": -11.8003,
+            "b2": 7.1394
+        },
+        "Consumer Goods (Hàng tiêu dùng)": {
+            "n_samples": 208,
+            "optimal_leverage": -8.1002,
+            "r_squared": 0.7032,
+            "adj_r_squared": 0.7003,
+            "p_value_b2": 0.7847,
+            "b0": 4.6917,
+            "b1": -5.1314,
+            "b2": -0.3167
+        },
+        "Industrials (Công nghiệp)": {
+            "n_samples": 268,
+            "optimal_leverage": null,
+            "r_squared": 0.5565,
+            "adj_r_squared": 0.5532,
+            "p_value_b2": 0.0,
+            "b0": 10.9599,
+            "b1": -31.5447,
+            "b2": 22.9723
+        },
+        "Oil & Gas (Dầu khí)": {
+            "n_samples": 88,
+            "optimal_leverage": null,
+            "r_squared": 0.1575,
+            "adj_r_squared": 0.1377,
+            "p_value_b2": 0.4132,
+            "b0": 6.7429,
+            "b1": -9.8825,
+            "b2": 4.6573
+        },
+        "Technology (Công nghệ)": {
+            "n_samples": 56,
+            "optimal_leverage": null,
+            "r_squared": 0.5399,
+            "adj_r_squared": 0.5225,
+            "p_value_b2": 0.0,
+            "b0": 14.1297,
+            "b1": -47.4675,
+            "b2": 42.332
+        }
+    },
+    "history": [
+        {
+            "timestamp": "2026-08-22 08:34:27",
+            "quarter": "Q3/2026",
+            "file_used": "BCTC_Tu_Dong_Vnstock.xlsx",
+            "sectors_count": 5,
+            "applied_thresholds": {
+                "Basic Materials (Nguyên vật liệu)": 0.745,
+                "Consumer Goods (Hàng tiêu dùng)": 0.5201,
+                "Industrials (Công nghiệp)": 0.3989,
+                "Oil & Gas (Dầu khí)": 1.1176,
+                "Technology (Công nghệ)": 0.4441
+            }
+        },
+        {
+            "timestamp": "2026-08-22 08:34:16",
+            "quarter": "Q3/2026",
+            "file_used": "BCTC_Tu_Dong_Vnstock.xlsx",
+            "sectors_count": 5,
+            "applied_thresholds": {
+                "Basic Materials (Nguyên vật liệu)": 0.745,
+                "Consumer Goods (Hàng tiêu dùng)": 0.5201,
+                "Industrials (Công nghiệp)": 0.3989,
+                "Oil & Gas (Dầu khí)": 1.1176,
+                "Technology (Công nghệ)": 0.4441
+            }
+        }
+    ]
+}

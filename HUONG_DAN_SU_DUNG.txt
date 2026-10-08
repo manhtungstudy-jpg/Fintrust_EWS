@@ -1,0 +1,26 @@
+================================================================================
+           HỆ THỐNG CẢNH BÁO SỚM RỦI RO TÍN DỤNG & THẨM ĐỊNH BCTC (FINTRUST EWS)
+================================================================================
+
+1. YÊU CẦU HỆ THỐNG:
+   - Máy tính đã cài đặt Python 3.10 hoặc 3.11 (https://www.python.org/downloads/)
+   - Khi cài đặt Python trên Windows, nhớ tích chọn ô [x] 'Add Python to PATH'.
+
+2. HƯỚNG DẪN KHỞI ĐỘNG (1-CLICK RUN):
+   - Đối với Windows: Click đúp vào file 'run_local.bat'
+   - Đối với Mac / Linux: Mở Terminal, gõ: bash run_local.sh
+
+   Phần mềm sẽ tự động:
+   + Khởi tạo môi trường ảo (venv).
+   + Cài đặt các thư viện cần thiết tự động.
+   + Tự động mở giao diện web trên trình duyệt (http://localhost:8501).
+
+3. HƯỚNG DẪN TEST DỮ LIỆU NHANH:
+   - Trong thư mục 'BCTC_Mau_Test' đã có sẵn BCTC của các doanh nghiệp điển hình:
+     + HSG: Ngành Thép (Kiểm tra Chu kỳ tiền mặt CCC & Chi phí sản xuất Ab_PROD)
+     + ANV: Ngành Thủy sản xuất khẩu (Kiểm tra chuỗi thời gian EWS & Phải thu DSRI)
+     + CLC: Ngành Hàng tiêu dùng (Doanh nghiệp an toàn, dòng tiền tốt)
+     + FPT: Ngành Công nghệ
+     + ALV: Ngành Xây dựng (Kiểm tra đòn bẩy nợ và SA Index)
+   - Tải file PDF từ thư mục 'BCTC_Mau_Test' lên phần mềm để xem phân tích tự động.
+================================================================================
