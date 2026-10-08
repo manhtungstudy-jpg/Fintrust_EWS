@@ -741,36 +741,39 @@ def render_5c_radar_chart(c_scores):
     """
     Vẽ biểu đồ Radar 5 trục thể hiện điểm thành phần 5Cs của Doanh nghiệp.
     """
-    import matplotlib.pyplot as plt
-    categories = list(c_scores.keys())
-    values = [float(v) for v in c_scores.values()]
-    
-    # Khép kín vòng tròn
-    values += values[:1]
-    angles = np.linspace(0, 2 * np.pi, len(categories), endpoint=False).tolist()
-    angles += angles[:1]
-    
-    fig, ax = plt.subplots(figsize=(5.5, 5.5), subplot_kw=dict(polar=True))
-    ax.set_theta_offset(np.pi / 2)
-    ax.set_theta_direction(-1)
-    
-    # Vẽ trục và nhãn
-    plt.xticks(angles[:-1], categories, color="#2D3748", size=9, weight="bold")
-    ax.set_rlabel_position(30)
-    plt.yticks([20, 40, 60, 80, 100], ["20", "40", "60", "80", "100"], color="#718096", size=7)
-    plt.ylim(0, 100)
-    
-    # Vẽ đa giác dữ liệu của doanh nghiệp
-    ax.plot(angles, values, color="#3182CE", linewidth=2.5, linestyle='solid', label="Điểm Doanh nghiệp")
-    ax.fill(angles, values, color="#3182CE", alpha=0.25)
-    
-    # Vùng an toàn chuẩn mực (Benchmark 70 điểm)
-    bench_values = [70] * (len(categories) + 1)
-    ax.plot(angles, bench_values, color="#38A169", linewidth=1.5, linestyle='dashed', label="Ngưỡng Chuẩn (70đ)")
-    
-    ax.legend(loc='lower right', bbox_to_anchor=(1.15, -0.05), fontsize=8)
-    plt.tight_layout()
-    return fig
+    try:
+        import matplotlib.pyplot as plt
+        categories = list(c_scores.keys())
+        values = [float(v) for v in c_scores.values()]
+        
+        # Khép kín vòng tròn
+        values += values[:1]
+        angles = np.linspace(0, 2 * np.pi, len(categories), endpoint=False).tolist()
+        angles += angles[:1]
+        
+        fig, ax = plt.subplots(figsize=(5.5, 5.5), subplot_kw=dict(polar=True))
+        ax.set_theta_offset(np.pi / 2)
+        ax.set_theta_direction(-1)
+        
+        # Vẽ trục và nhãn
+        plt.xticks(angles[:-1], categories, color="#2D3748", size=9, weight="bold")
+        ax.set_rlabel_position(30)
+        plt.yticks([20, 40, 60, 80, 100], ["20", "40", "60", "80", "100"], color="#718096", size=7)
+        plt.ylim(0, 100)
+        
+        # Vẽ đa giác dữ liệu của doanh nghiệp
+        ax.plot(angles, values, color="#3182CE", linewidth=2.5, linestyle='solid', label="Điểm Doanh nghiệp")
+        ax.fill(angles, values, color="#3182CE", alpha=0.25)
+        
+        # Vùng an toàn chuẩn mực (Benchmark 70 điểm)
+        bench_values = [70] * (len(categories) + 1)
+        ax.plot(angles, bench_values, color="#38A169", linewidth=1.5, linestyle='dashed', label="Ngưỡng Chuẩn (70đ)")
+        
+        ax.legend(loc='lower right', bbox_to_anchor=(1.15, -0.05), fontsize=8)
+        plt.tight_layout()
+        return fig
+    except Exception as e:
+        return None
 
 # -------------------------------------------------------------------------
 # MODULE PHÂN TÍCH SAO KÊ DÒNG TIỀN NGÂN HÀNG (KHỐI 3 - HIGH-FREQUENCY CASHFLOW)
@@ -1124,61 +1127,6 @@ st.markdown("""
     .badge-green { background-color: #c6f6d5; color: #22543d; }
 </style>
 """, unsafe_allow_html=True)
-
-# -------------------------------------------------------------------------
-# XÁC THỰC MẬT KHẨU TRUY CẬP (BẢO MẬT NỘI BỘ)
-# -------------------------------------------------------------------------
-def check_password():
-    """Kiểm tra và yêu cầu nhập mật khẩu bảo vệ trước khi truy cập ứng dụng."""
-    target_password = "TrustF1n@"
-    try:
-        if hasattr(st, "secrets") and "APP_PASSWORD" in st.secrets:
-            target_password = st.secrets["APP_PASSWORD"]
-    except Exception:
-        pass
-
-    if st.session_state.get("authenticated", False):
-        return True
-
-    # Giao diện màn hình đăng nhập khóa bảo mật
-    col1, col2, col3 = st.columns([1, 2, 1])
-    with col2:
-        st.markdown("<br><br>", unsafe_allow_html=True)
-        st.markdown("""
-        <div style="background: linear-gradient(135deg, #1e3a8a 0%, #3b82f6 100%); padding: 30px; border-radius: 16px 16px 0 0; text-align: center; color: white;">
-            <h2 style="color: white; margin-bottom: 5px;">🛡️ FinTrust EWS</h2>
-            <p style="font-size: 14px; opacity: 0.9; margin-bottom: 0;">Hệ Thống Cảnh Báo Sớm Rủi Ro Tín Dụng & Thẩm Định BCTC</p>
-        </div>
-        """, unsafe_allow_html=True)
-        
-        with st.container():
-            st.markdown("""
-            <div style="background-color: white; padding: 25px; border-radius: 0 0 16px 16px; box-shadow: 0 10px 25px rgba(0,0,0,0.08); margin-bottom: 20px;">
-                <p style="color: #475569; font-size: 14px; text-align: center; margin-bottom: 15px;">
-                    🔒 <i>Hệ thống được bảo vệ. Vui lòng nhập mật khẩu được cấp để tiếp tục:</i>
-                </p>
-            """, unsafe_allow_html=True)
-            
-            with st.form("auth_login_form", clear_on_submit=False):
-                entered_pwd = st.text_input("Mật khẩu truy cập", type="password", placeholder="Nhập mật khẩu...", label_visibility="collapsed")
-                submitted = st.form_submit_button("🔑 Mở khóa hệ thống", use_container_width=True, type="primary")
-                
-                if submitted:
-                    if entered_pwd == target_password:
-                        st.session_state["authenticated"] = True
-                        st.success("✅ Xác thực thành công! Đang chuyển hướng...")
-                        st.rerun()
-                    else:
-                        st.error("❌ Mật khẩu không chính xác. Vui lòng thử lại!")
-            
-            st.markdown("</div>", unsafe_allow_html=True)
-            st.caption("🔒 Bảo mật nội bộ FinTrust. Liên hệ Quản trị viên nếu cần cấp quyền.")
-            
-    return False
-
-if not check_password():
-    st.stop()
-
 
 # -------------------------------------------------------------------------
 # BẢN ĐỒ MÃ SỐ CHỈ TIÊU BCTC THEO THÔNG TƯ 200/2014/TT-BTC
@@ -3585,10 +3533,6 @@ st.caption("Financial Statement Risk & Early Warning System (EWS) - Công cụ �
 
 # Cấu hình thanh bên (Sidebar)
 st.sidebar.title("🛡️ FinTrust EWS Engine")
-if st.sidebar.button("🔒 Đăng xuất", key="btn_auth_logout", use_container_width=True):
-    st.session_state["authenticated"] = False
-    st.rerun()
-
 app_mode = st.sidebar.radio("Chức năng hệ thống:", ["🔍 Đánh giá rủi ro tài chính BCTC", "🎛️ Tái ước lượng đòn bẩy (U-Curve)"])
 st.sidebar.markdown("---")
 
@@ -4725,7 +4669,10 @@ if extracted_data:
         with col_5c_sum2:
             st.markdown("#### 📊 Biểu đồ Radar 5 Trục Định Tính vs Ngưỡng Chuẩn (70đ)")
             radar_fig = render_5c_radar_chart(res_5cs["radar_data"])
-            st.pyplot(radar_fig, use_container_width=True)
+            if radar_fig is not None:
+                st.pyplot(radar_fig, use_container_width=True)
+            else:
+                st.info("📊 Điểm định tính 5Cs đã được tính toán đầy đủ.")
             
         st.markdown("---")
         st.subheader("📋 Bảng Tiêu chí Chấm điểm Định tính Chi tiết (5Cs Standard Rubrics)")
