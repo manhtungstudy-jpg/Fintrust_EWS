@@ -10,16 +10,145 @@ import math
 import sqlite3
 import datetime
 import sys
+import shutil
+import tempfile
+import credit_underwriting_engine as cue
 
 # -------------------------------------------------------------------------
 # CƠ SỞ DỮ LIỆU SQLITE VÀ HÀM TIÊU CHUẨN HÓA DỮ LIỆU (BƯỚC 1)
 # -------------------------------------------------------------------------
 # Lấy thư mục chạy thực tế từ biến môi trường (được truyền từ desktop_wrapper.py) để lưu database cố định
 BASE_DIR = os.environ.get("FINTRUST_EXE_DIR", os.path.dirname(os.path.abspath(__file__)))
-DB_PATH = os.path.join(BASE_DIR, "fintrust_ews.db")
+
+_RESOLVED_DB_PATH = None
+_RESOLVED_STORAGE_DIR = None
+
+def _is_dir_writable(dir_path):
+    """Kiểm tra quyền ghi vào thư mục để đảm bảo SQLite có thể tạo journal/WAL file."""
+    try:
+        if not os.path.exists(dir_path):
+            os.makedirs(dir_path, exist_ok=True)
+        test_file = os.path.join(dir_path, f".write_test_{os.getpid()}.tmp")
+        with open(test_file, "w") as f:
+            f.write("test")
+        if os.path.exists(test_file):
+            os.remove(test_file)
+        return True
+    except Exception:
+        return False
+
+def _can_write_sqlite_file(file_path):
+    """Kiểm tra tệp tin database có thể ghi được không bằng thao tác ghi thử nghiệm thực tế."""
+    try:
+        dir_name = os.path.dirname(os.path.abspath(file_path))
+        if not _is_dir_writable(dir_name):
+            return False
+        if os.path.exists(file_path):
+            if not os.access(file_path, os.W_OK):
+                return False
+            conn = sqlite3.connect(file_path, timeout=5.0)
+            try:
+                conn.execute("CREATE TABLE IF NOT EXISTS _perm_check (id INTEGER PRIMARY KEY)")
+                conn.execute("INSERT OR REPLACE INTO _perm_check (id) VALUES (1)")
+                conn.execute("DELETE FROM _perm_check WHERE id = 1")
+                conn.commit()
+            finally:
+                conn.close()
+        return True
+    except Exception:
+        return False
+
+def get_db_path():
+    """Xác định đường dẫn DB SQLite có toàn quyền đọc/ghi.
+    Trên Streamlit Community Cloud (Linux container), thư mục /mount/src/ thường chỉ đọc (read-only).
+    Hàm này tự động sao chép database gốc sang thư mục ghi được (~/.fintrust hoặc /tmp) 
+    để các thao tác lưu dữ liệu luôn thành công 100%.
+    """
+    global _RESOLVED_DB_PATH
+    if _RESOLVED_DB_PATH is not None and os.path.exists(os.path.dirname(_RESOLVED_DB_PATH)):
+        return _RESOLVED_DB_PATH
+
+    default_db = os.path.join(BASE_DIR, "fintrust_ews.db")
+    if _can_write_sqlite_file(default_db):
+        _RESOLVED_DB_PATH = default_db
+        return default_db
+    
+    # Fallback cho môi trường đám mây (Streamlit Cloud, Docker container)
+    candidate_dirs = [
+        os.path.join(os.path.expanduser("~"), ".fintrust"),
+        os.path.join(tempfile.gettempdir(), "fintrust")
+    ]
+    for c_dir in candidate_dirs:
+        try:
+            if not os.path.exists(c_dir):
+                os.makedirs(c_dir, exist_ok=True)
+            candidate_db = os.path.join(c_dir, "fintrust_ews.db")
+            if not os.path.exists(candidate_db) and os.path.exists(default_db):
+                try:
+                    shutil.copy2(default_db, candidate_db)
+                except Exception:
+                    pass
+            if _can_write_sqlite_file(candidate_db):
+                _RESOLVED_DB_PATH = candidate_db
+                return candidate_db
+        except Exception:
+            continue
+            
+    _RESOLVED_DB_PATH = os.path.join(tempfile.gettempdir(), "fintrust_ews.db")
+    return _RESOLVED_DB_PATH
+
+def get_storage_dir():
+    """Xác định thư mục lưu trữ storage có quyền ghi."""
+    global _RESOLVED_STORAGE_DIR
+    if _RESOLVED_STORAGE_DIR is not None and os.path.exists(_RESOLVED_STORAGE_DIR):
+        return _RESOLVED_STORAGE_DIR
+
+    default_storage = os.path.join(BASE_DIR, "storage")
+    if _is_dir_writable(default_storage):
+        _RESOLVED_STORAGE_DIR = default_storage
+        return default_storage
+    
+    candidate_dirs = [
+        os.path.join(os.path.expanduser("~"), ".fintrust", "storage"),
+        os.path.join(tempfile.gettempdir(), "fintrust", "storage")
+    ]
+    for c_dir in candidate_dirs:
+        try:
+            if not os.path.exists(c_dir):
+                os.makedirs(c_dir, exist_ok=True)
+            if os.path.exists(default_storage):
+                for item in os.listdir(default_storage):
+                    s_file = os.path.join(default_storage, item)
+                    d_file = os.path.join(c_dir, item)
+                    if os.path.isfile(s_file) and not os.path.exists(d_file):
+                        try:
+                            shutil.copy2(s_file, d_file)
+                        except Exception:
+                            pass
+            if _is_dir_writable(c_dir):
+                _RESOLVED_STORAGE_DIR = c_dir
+                return c_dir
+        except Exception:
+            continue
+            
+    _RESOLVED_STORAGE_DIR = os.path.join(tempfile.gettempdir(), "storage")
+    return _RESOLVED_STORAGE_DIR
+
+DB_PATH = get_db_path()
+STORAGE_DIR = get_storage_dir()
+
+def get_db_connection(timeout=30.0):
+    """Mở kết nối SQLite an toàn với timeout và cấu hình tương thích đa người dùng."""
+    target_path = get_db_path()
+    conn = sqlite3.connect(target_path, timeout=timeout)
+    try:
+        conn.execute("PRAGMA journal_mode=WAL")
+    except Exception:
+        pass
+    return conn
 
 def init_db():
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_db_connection()
     cursor = conn.cursor()
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS companies (
@@ -40,21 +169,89 @@ def init_db():
     conn.commit()
     conn.close()
 
-def save_to_db(ticker, company_name, financial_data):
-    conn = sqlite3.connect(DB_PATH)
+def _perform_save_to_db(db_path, ticker, company_name, financial_data):
+    conn = sqlite3.connect(db_path, timeout=30.0)
+    try:
+        conn.execute("PRAGMA journal_mode=WAL")
+    except Exception:
+        pass
     cursor = conn.cursor()
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS companies (
+            ticker TEXT PRIMARY KEY,
+            company_name TEXT
+        )
+    """)
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS financial_data (
+            ticker TEXT,
+            year INTEGER,
+            variable TEXT,
+            value REAL,
+            PRIMARY KEY (ticker, year, variable),
+            FOREIGN KEY (ticker) REFERENCES companies(ticker)
+        )
+    """)
     cursor.execute("INSERT OR REPLACE INTO companies (ticker, company_name) VALUES (?, ?)", (ticker, company_name))
     for year, data in financial_data.items():
+        if not isinstance(data, dict):
+            continue
+        try:
+            year_int = int(year)
+        except (ValueError, TypeError):
+            continue
         for var, val in data.items():
             if var.startswith("_"):
                 continue
-            val_to_save = float(val) if (val is not None and not pd.isna(val)) else None
+            if val is None or (isinstance(val, (float, np.floating)) and pd.isna(val)):
+                val_to_save = None
+            else:
+                try:
+                    val_to_save = float(val)
+                except (ValueError, TypeError):
+                    val_to_save = str(val)
             cursor.execute("""
                 INSERT OR REPLACE INTO financial_data (ticker, year, variable, value) 
                 VALUES (?, ?, ?, ?)
-            """, (ticker, int(year), var, val_to_save))
+            """, (ticker, year_int, var, val_to_save))
     conn.commit()
     conn.close()
+
+def save_to_db(ticker, company_name, financial_data):
+    global _RESOLVED_DB_PATH
+    current_path = get_db_path()
+    try:
+        _perform_save_to_db(current_path, ticker, company_name, financial_data)
+    except sqlite3.OperationalError:
+        # Nếu đường dẫn hiện tại bị lỗi ghi (readonly/lock trên Cloud), fallback ngay sang /tmp
+        fallback_db = os.path.join(tempfile.gettempdir(), "fintrust_ews.db")
+        if fallback_db != current_path:
+            if not os.path.exists(fallback_db):
+                default_db = os.path.join(BASE_DIR, "fintrust_ews.db")
+                if os.path.exists(default_db):
+                    try:
+                        shutil.copy2(default_db, fallback_db)
+                    except Exception:
+                        pass
+            _RESOLVED_DB_PATH = fallback_db
+            init_db()
+            _perform_save_to_db(fallback_db, ticker, company_name, financial_data)
+        else:
+            raise
+
+    # Đồng bộ sang file cache JSON nếu có thể
+    try:
+        st_dir = get_storage_dir()
+        json_file = os.path.join(st_dir, f"{ticker}.json")
+        payload = {
+            "ticker": ticker,
+            "company_name": company_name,
+            "financial_data": financial_data
+        }
+        with open(json_file, "w", encoding="utf-8") as f_j:
+            json.dump(payload, f_j, ensure_ascii=False, indent=4)
+    except Exception:
+        pass
 
 def reconcile_financial_data(financial_data):
     """Tự động chuẩn hóa và cân đối các chỉ tiêu kế toán cơ bản theo Thông tư 200."""
@@ -65,10 +262,13 @@ def reconcile_financial_data(financial_data):
         cogs = y_data.get("COGS")
         gp = y_data.get("Gross_Profit")
         
-        # 1. Chuẩn hóa các chỉ tiêu tài sản và chi phí luôn dương
+        # 1. Chuẩn hóa các chỉ tiêu tài sản và chi phí luôn dương, bảo vệ chống crash kiểu dữ liệu
         for pos_var in ["COGS", "Selling_Expense", "GA_Expense", "Interest_Expense", "Tangible_PPE_Cost", "Total_Assets", "Total_Liabilities", "Current_Liabilities", "Current_Assets", "Fixed_Assets", "Cash_Equivalents", "Inventories", "Current_Receivables", "Accounts_Receivable"]:
             if pos_var in y_data and y_data[pos_var] is not None and not pd.isna(y_data[pos_var]):
-                y_data[pos_var] = abs(y_data[pos_var])
+                try:
+                    y_data[pos_var] = abs(float(y_data[pos_var]))
+                except (ValueError, TypeError):
+                    y_data[pos_var] = 0.0
             
         # 2. Cân đối KQKD: Lợi nhuận gộp (20) = Doanh thu thuần (10) - Giá vốn (11)
         if sales is not None and not pd.isna(sales) and sales > 0:
@@ -88,6 +288,20 @@ def reconcile_financial_data(financial_data):
         if (liab is None or pd.isna(liab) or liab == 0) and cl is not None and not pd.isna(cl) and cl > 0:
             liab = cl + ncl
             y_data["Total_Liabilities"] = liab
+
+        # Nếu Nợ ngắn hạn (310) bị 0 đ nhưng có Nợ phải trả (300) > 0 (Khắc phục lỗi scan CSC Slide 19)
+        if (cl is None or pd.isna(cl) or cl == 0) and liab is not None and not pd.isna(liab) and liab > 0:
+            if ncl > 0 and ncl < liab:
+                cl = liab - ncl
+            else:
+                cl = liab
+            y_data["Current_Liabilities"] = cl
+
+        # Nếu Phải thu khách hàng (131) bị 0 đ nhưng có Phải thu ngắn hạn (130) > 0 (Khắc phục lỗi scan CSC Slide 19)
+        rec = y_data.get("Accounts_Receivable")
+        c_rec = y_data.get("Current_Receivables")
+        if (rec is None or pd.isna(rec) or rec == 0) and c_rec is not None and not pd.isna(c_rec) and c_rec > 0:
+            y_data["Accounts_Receivable"] = c_rec
 
         # Kiểm tra nếu Tổng tài sản bị OCR đọc nhầm mã số nhỏ (ví dụ < 1 tỷ trong khi Nợ + Vốn > 100 tỷ)
         if liab is not None and eq is not None and not pd.isna(liab) and not pd.isna(eq) and (liab + eq) > 1e9:
@@ -126,7 +340,7 @@ def reconcile_financial_data(financial_data):
     return financial_data
 
 def load_from_db(ticker):
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_db_connection()
     cursor = conn.cursor()
     cursor.execute("SELECT company_name FROM companies WHERE ticker = ?", (ticker,))
     row = cursor.fetchone()
@@ -151,7 +365,7 @@ def load_from_db(ticker):
 
 @st.cache_data(ttl=60, show_spinner=False)
 def get_saved_tickers_from_db():
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_db_connection()
     cursor = conn.cursor()
     cursor.execute("SELECT ticker, company_name FROM companies ORDER BY ticker")
     rows = cursor.fetchall()
@@ -800,8 +1014,24 @@ def generate_mock_bank_statement_data(ticker="HSG", company_name="CTCP Tập đo
     phục vụ việc kiểm soát sau giải ngân và phân tích tần suất cao.
     """
     import random
-    monthly_rev = annual_revenue / 12.0 if annual_revenue > 0 else 2500e9 / 12.0
-    monthly_cogs = annual_cogs / 12.0 if annual_cogs > 0 else 2000e9 / 12.0
+    
+    # Chuẩn hóa biên độ doanh thu và giá vốn tránh trường hợp OCR lỗi hoặc lệch đơn vị
+    try:
+        ann_rev = float(annual_revenue) if annual_revenue is not None else 0.0
+    except Exception:
+        ann_rev = 0.0
+    try:
+        ann_c = float(annual_cogs) if annual_cogs is not None else 0.0
+    except Exception:
+        ann_c = 0.0
+        
+    if ann_rev < 10e9 or ann_rev > 200000e9:
+        ann_rev = 500e9  # Mặc định 500 tỷ VND cho doanh nghiệp quy mô tiêu chuẩn
+    if ann_c < 5e9 or ann_c > ann_rev:
+        ann_c = ann_rev * 0.82  # Giá vốn ~ 82% doanh thu
+        
+    monthly_rev = ann_rev / 12.0
+    monthly_cogs = ann_c / 12.0
     
     # Đối tác mẫu tùy theo doanh nghiệp
     if ticker in ["HSG", "HPG", "NKG", "TLH"]:
@@ -1259,6 +1489,12 @@ TICKER_NAME_MAP = {
     "BCV": "Công ty Cổ phần Vincom Bình Chánh",
     "ALV": "Công ty Cổ phần Xây dựng ALVICO",
     "ANV": "Công ty Cổ phần Nam Việt",
+    "TCO": "Công ty Cổ phần TCO HOLDINGS",
+    "PAN": "Công ty Cổ phần Tập đoàn PAN",
+    "VCF": "Công ty Cổ phần Vinacafé Biên Hòa",
+    "CSC": "Công ty Cổ phần Tập đoàn COTANA",
+    "TID": "Công ty Cổ phần Tổng Công ty Tín Nghĩa",
+    "HNR": "Công ty Cổ phần Rượu và Nước giải khát Hà Nội",
 }
 
 COMPANY_ACCENT_REPLACEMENTS = {
@@ -1280,6 +1516,7 @@ COMPANY_ACCENT_REPLACEMENTS = {
     r'\bNONG\s+NGHIEP\b': 'Nông nghiệp',
     r'\bGIAO\s+THONG\b': 'Giao thông',
     r'\bVAN\s+TAI\b': 'Vận tải',
+    r'\bVAN\s+TAL\b': 'Vận tải',
     r'\bDU\s+LICH\b': 'Du lịch',
     r'\bDO\s+THI\b': 'Đô thị',
     r'\bMOI\s+TRUONG\b': 'Môi trường',
@@ -1303,7 +1540,7 @@ COMPANY_ACCENT_REPLACEMENTS = {
     r'\bCONG\s+NGHE\b': 'Công nghệ',
     r'\bVIEN\s+THONG\b': 'Viễn thông',
     
-    # Proper Names
+    # Proper Names & Custom
     r'\bALVICO\b': 'ALVICO',
     r'\bHOA\s+SEN\b': 'Hoa Sen',
     r'\bHOA\s+PHAT\b': 'Hòa Phát',
@@ -1344,6 +1581,10 @@ COMPANY_ACCENT_REPLACEMENTS = {
     r'\bSAI\s+GON\b': 'Sài Gòn',
     r'\bTP\s+HO\s+CHI\s+MINH\b': 'TP. Hồ Chí Minh',
     r'\bHO\s+CHI\s+MINH\b': 'Hồ Chí Minh',
+    r'\bDA\s+PHUONG\s+THUC\b': 'Đa phương thức',
+    r'\bDUYEN\s+HAI\b': 'Duyên Hải',
+    r'\bHOLDINGS\b': 'HOLDINGS',
+    r'\bTCO\b': 'TCO',
 }
 
 def clean_company_name(name, ticker):
@@ -1373,7 +1614,7 @@ def clean_company_name(name, ticker):
     formatted_words = []
     for w in words:
         w_upper = w.upper()
-        if w_upper in ["TNHH", "CP", "JSCO", "VIX", "FPT", "HSG", "HPG", "VCB", "TCB", "MBB", "VIC", "VNM", "MSN", "ACB", "STB", "VPB", "BID", "CTG", "ALV", "ALVICO"]:
+        if w_upper in ["TNHH", "CP", "JSCO", "VIX", "FPT", "HSG", "HPG", "VCB", "TCB", "MBB", "VIC", "VNM", "MSN", "ACB", "STB", "VPB", "BID", "CTG", "ALV", "ALVICO", "TCO", "HOLDINGS", "PAN"]:
             formatted_words.append(w_upper)
         elif w_upper.startswith("TP.") or w_upper == "TP":
             formatted_words.append(w)
@@ -1386,18 +1627,150 @@ def strip_accents(text):
     text = text.lower().replace('đ', 'd')
     return ''.join(c for c in unicodedata.normalize('NFD', text) if unicodedata.category(c) != 'Mn')
 
+COMPANY_NAME_TO_TICKER_ALIASES = {
+    "COTANA": "CSC",
+    "DUYEN HAI": "TCO",
+    "TCO HOLDINGS": "TCO",
+    "TCO": "TCO",
+    "VINACAFE": "VCF",
+    "HOA SEN": "HSG",
+    "HOA PHAT": "HPG",
+    "TIN NGHIA": "TID",
+    "ALVICO": "ALV",
+    "BAO BI HOANG THACH": "BBH",
+    "NONG SAN XUAT KHAU SAI GON": "AGX",
+    "RUOU VA NUOC GIAI KHAT HA NOI": "HNR",
+    "VINCOM RETAIL": "VRE",
+    "DAT XANH": "DXG",
+    "NAM LONG": "NLG",
+    "KHANG DIEN": "KDH",
+    "PHAT DAT": "PDR",
+    "DABACO": "DBC",
+    "VINH HOAN": "VHC",
+    "NAM VIET": "ANV",
+    "BAMBOO CAPITAL": "BCG",
+    "HA DO": "HDG",
+    "GELEX": "GEX",
+    "KINH BAC": "KBC",
+    "VINACONEX": "VCG",
+    "CO DIEN LANH": "REE",
+    "HOANG ANH GIA LAI": "HAG",
+    "THANH THANH CONG": "SBT",
+    "LOC HOA DAU BINH SON": "BSR",
+    "PC1": "PC1",
+    "MAY SONG HONG": "MSH",
+    "VIETCOMBANK": "VCB",
+    "TECHCOMBANK": "TCB",
+    "MBBANK": "MBB",
+    "VINGROUP": "VIC",
+    "VINHOMES": "VHM",
+    "VINAMILK": "VNM",
+    "MASAN": "MSN",
+    "FPT": "FPT",
+}
+
+def resolve_main_ticker(tickers_detected, summary_company_name, filenames=None):
+    """
+    Suy luận và xác định mã chứng khoán / mã định danh doanh nghiệp một cách thông minh,
+    đảm bảo không bao giờ trả về 'N/A' để hệ thống luôn tự động lưu dữ liệu vào SQLite/JSON cache.
+    Hỗ trợ cả doanh nghiệp niêm yết (HOSE, HNX, UPCOM) và doanh nghiệp chưa niêm yết (SME/Unlisted).
+    """
+    # 1. Nếu đã có mã hợp lệ trong tickers_detected
+    if tickers_detected:
+        for t in tickers_detected:
+            if t and t != "N/A" and len(t) in [3, 4] and t.isalpha() and t not in ["BCTC", "PDF", "XLS", "XLSX", "DATA"]:
+                return t.upper()
+        valid_t = [t for t in tickers_detected if t and t != "N/A" and t not in ["BCTC", "PDF", "XLS", "XLSX", "DATA"]]
+        if valid_t:
+            return valid_t[0].upper()
+
+    # 2. Tra cứu theo tên công ty qua từ điển Aliases & TICKER_NAME_MAP
+    if summary_company_name and summary_company_name != "Không rõ":
+        name_clean = strip_accents(summary_company_name).upper()
+        # Kiểm tra trước trong bảng Aliases rút gọn
+        for kw, t_code in COMPANY_NAME_TO_TICKER_ALIASES.items():
+            if kw in name_clean:
+                return t_code
+
+        # Tra cứu tên cốt lõi trong TICKER_NAME_MAP
+        core_search = re.sub(
+            r'^(?:CONG\s+TY\s+(?:CO\s+PHAN|TNHH|TRACH\s+NHIEM\s+HUU\s+HAN)|TONG\s+CONG\s+TY|TAP\s+DOAN)\s*', 
+            '', name_clean
+        ).strip()
+        for t_code, t_name in TICKER_NAME_MAP.items():
+            t_core = re.sub(
+                r'^(?:CONG\s+TY\s+(?:CO\s+PHAN|TNHH|TRACH\s+NHIEM\s+HUU\s+HAN)|TONG\s+CONG\s+TY|TAP\s+DOAN)\s*', 
+                '', strip_accents(t_name).upper()
+            ).strip()
+            if t_code in core_search.split():
+                return t_code
+            if len(t_core) >= 4 and (t_core in core_search or core_search in t_core):
+                return t_code
+
+    # 3. Tra cứu từ tên các file tải lên
+    if filenames:
+        for fn in filenames:
+            fn_clean = re.sub(r'[^a-zA-Z0-9\s_-]', '', fn)
+            tokens = re.split(r'[\s_.-]', fn_clean)
+            for tok in tokens:
+                tok_u = tok.upper()
+                if tok_u in TICKER_NAME_MAP:
+                    return tok_u
+                if tok_u in COMPANY_NAME_TO_TICKER_ALIASES:
+                    return COMPANY_NAME_TO_TICKER_ALIASES[tok_u]
+                if len(tok_u) in [3, 4] and tok_u.isalpha() and tok_u not in ["BCTC", "PDF", "XLS", "XLSX", "DATA", "FILE", "MAU", "NAM", "BAO", "CAO"]:
+                    return tok_u
+
+    # 4. Fallback cho Doanh nghiệp chưa niêm yết (Unlisted / SME): Tạo mã định danh chuẩn hóa từ tên DN
+    if summary_company_name and summary_company_name != "Không rõ":
+        name_clean = strip_accents(summary_company_name).upper()
+        core_name = re.sub(
+            r'^(?:CONG\s+TY\s+(?:CO\s+PHAN|TNHH|TRACH\s+NHIEM\s+HUU\s+HAN)|TONG\s+CONG\s+TY|TAP\s+DOAN)\s*', 
+            '', name_clean
+        ).strip()
+        words = [w for w in re.split(r'[^A-Z0-9]+', core_name) if w]
+        if words:
+            generic_words = {
+                "CONG", "TY", "CO", "PHAN", "TNHH", "TONG", "TAP", "DOAN", 
+                "THUONG", "MAI", "DICH", "VU", "SAN", "XUAT", "XAY", "DUNG", 
+                "DAU", "TU", "PHAT", "TRIEN", "VIET", "NAM", "QUOC", "TE", 
+                "CONG", "NGHIEP", "VAN", "TAI", "DA", "PHUONG", "THUC"
+            }
+            distinctive = [w for w in words if len(w) >= 3 and w not in generic_words]
+            if distinctive:
+                return distinctive[0][:6]
+            acronym = "".join(w[0] for w in words if w)[:5]
+            if len(acronym) >= 3:
+                return acronym
+            return f"DN_{words[0][:6]}"
+
+    # 5. Fallback từ tên file nếu không có cả tên công ty
+    if filenames:
+        base_fn = os.path.splitext(os.path.basename(filenames[0]))[0]
+        clean_base = re.sub(r'[^A-Z0-9]+', '', strip_accents(base_fn).upper())
+        if clean_base:
+            return clean_base[:8]
+
+    return "DN_MOI"
+
+
 def clean_bctc_line(line):
     """Làm sạch và nối các ký tự số bị phân tách lỗi do font hoặc OCR."""
     if not line:
         return ""
-    # 1. Nối dấu ngoặc đơn âm: '( 1 575 428 453 )' -> '(1575428453)'
+    # 1. Nối dấu ngoặc đơn âm và làm sạch viền bảng: '|( 1 575 428 453 )|' -> '(1575428453)'
+    line = re.sub(r'\|\s*\(\s*([0-9\.\,\s]+)\s*\)\s*\|?', r'(\1)', line)
     line = re.sub(r'\(\s*([0-9\.\,\s]+)\s*\)', lambda m: '(' + re.sub(r'\s+', '', m.group(1)) + ')', line)
     # 2. Nối nhóm 3 chữ số cách nhau bằng space: '52 617 900 827' -> '52617900827'
     line = re.sub(r'\b(\d{1,3}(?:\s+\d{3}){2,})\b', lambda m: re.sub(r'\s+', '', m.group(1)), line)
-    # 3. Loại bỏ phương trình kế toán trong ngoặc đơn để tránh nhầm mã số: (270 = 100 + 200) -> ''
+    # 3. Nối cụm số có dấu chấm bị ngắt trước 3 chữ số cuối: '6.597.155 148' -> '6.597.155.148'
+    line = re.sub(r'\b(\d{1,3}(?:\.\d{3})+)\s+(\d{3})\b', r'\1.\2', line)
+    # 4. Nối 2 cụm số có dấu chấm bị ngắt bởi dấu cách: '5.065 330.964' -> '5.065.330.964', '294.407 876.683' -> '294.407.876.683'
+    line = re.sub(r'\b(\d{1,3}(?:\.\d{3})*)\s+(\d{3}(?:\.\d{3})+)\b', r'\1.\2', line)
+    # 5. Nối số đứng đầu có dấu chấm và khoảng trắng trước cụm số nghìn: '5. 132.900.852' -> '5.132.900.852'
+    line = re.sub(r'\b(\d{1,3})\.\s+(\d{3}(?:\.\d{3})+)\b', r'\1.\2', line)
+    # 6. Loại bỏ phương trình kế toán trong ngoặc đơn để tránh nhầm mã số: (270 = 100 + 200) -> ''
     line = re.sub(r'\(\s*\d+\s*[=\+\-\*\/][^\)]*\)', '', line)
-    # 4. Chỉ nối nếu là 1 chữ số đứng trước 1 chữ số + dấu chấm nghìn (ví dụ '5 2.617.900...' -> '52.617.900...'):
-    line = re.sub(r'\b([1-9])\s+([0-9]\.\d{3}(?:\.\d{3})+)\b', r'\1\2', line)
     return line
 
 def detect_statement_type(text):
@@ -1505,7 +1878,7 @@ KEYWORDS_CONFIG_SF = {
     },
     "COGS": {
         "pos": [["giavon"], ["giaven"], ["giavonhangban"]],
-        "neg": []
+        "neg": ["khac", "loinhuan", "thunhap", "laivay"]
     },
     "Gross_Profit": {
         "pos": [["loinhuangop"], ["lngop"]],
@@ -1513,15 +1886,15 @@ KEYWORDS_CONFIG_SF = {
     },
     "Interest_Expense": {
         "pos": [["laivay"], ["chiphilaivay"], ["trongdo:chiphilaivay"]],
-        "neg": []
+        "neg": ["doanhthu", "khac", "banhang", "quanly", "thue", "giabon", "giavon", "gop", "taisan", "no", "von", "nguonvon", "tien"]
     },
     "Selling_Expense": {
         "pos": [["chiphibanhang"], ["cpbanhang"]],
-        "neg": ["khac", "quanly", "thuyetminh", "taichinh", "thue"]
+        "neg": ["khac", "quanly", "thuyetminh", "taichinh", "thue", "doanhthu", "giabon", "giavon", "laivay"]
     },
     "GA_Expense": {
         "pos": [["chiphiquanly"], ["cpquanly"], ["chiphiquanlydoanhnghiep"]],
-        "neg": ["khac", "banhang", "taichinh"]
+        "neg": ["khac", "banhang", "taichinh", "doanhthu", "giabon", "giavon", "laivay"]
     },
     "EBT": {
         "pos": [["loinhuantruocthue"], ["loinhuanketoantruocthue"], ["lntruocthue"]],
@@ -1538,6 +1911,11 @@ KEYWORDS_CONFIG_SF = {
 }
 
 def match_line_to_var_sf(line_text, code_token, statement):
+    # Dòng chỉ chứa số liệu hoặc không đủ từ ngữ tiếng Việt thì không được coi là chỉ tiêu kế toán mới
+    letters_only = re.findall(r'[a-zA-Z\u00C0-\u1EF9]', line_text)
+    if len(letters_only) < 4:
+        return None
+
     var_to_statement = {
         "Current_Assets": "CDKT", "Cash_Equivalents": "CDKT", "Current_Receivables": "CDKT",
         "Accounts_Receivable": "CDKT", "Inventories": "CDKT", "Fixed_Assets": "CDKT",
@@ -1619,7 +1997,7 @@ def match_line_to_var_sf(line_text, code_token, statement):
 def extract_numbers_from_tokens(tokens, code_token):
     numeric_vals = []
     for vt in tokens:
-        cleaned_vt = vt.strip()
+        cleaned_vt = vt.strip(" \t\r\n|:;,~")
         if not cleaned_vt:
             continue
             
@@ -1629,12 +2007,9 @@ def extract_numbers_from_tokens(tokens, code_token):
             continue
             
         is_neg = False
-        if cleaned_vt.startswith("(") and cleaned_vt.endswith(")"):
+        if (cleaned_vt.startswith("(") and cleaned_vt.endswith(")")) or ("(" in cleaned_vt and ")" in cleaned_vt) or cleaned_vt.startswith("-") or cleaned_vt.endswith("-"):
             is_neg = True
-            cleaned_vt = cleaned_vt[1:-1]
-        if cleaned_vt.startswith("-"):
-            is_neg = True
-            cleaned_vt = cleaned_vt[1:]
+            cleaned_vt = re.sub(r'[\(\)]', '', cleaned_vt)
         
         # Giữ lại chỉ các chữ số và dấu trừ trong token sau khi đã xử lý âm để loại bỏ dấu phân cách, 
         # ký tự rác hoặc lỗi OCR phân tách ký tự đặc biệt (ví dụ: U+2044 fraction slash '⁄')
@@ -1651,12 +2026,17 @@ def extract_numbers_from_tokens(tokens, code_token):
         except ValueError:
             continue
 
-    # Lọc bỏ cột Thuyết minh nếu có thừa số ở đầu dòng:
+    # 1. Lọc bỏ cột Thuyết minh nếu có thừa số ở đầu dòng:
     # Nếu danh sách có nhiều hơn 2 số và số đầu tiên là số nhỏ (< 100 và != 0) 
     # trong khi các số phía sau là số tài chính thực tế (>= 1,000,000 hoặc == 0)
     if len(numeric_vals) > 2:
         if 0 < abs(numeric_vals[0]) < 100 and any(abs(v) >= 1000000 or v == 0 for v in numeric_vals[1:]):
             numeric_vals = numeric_vals[1:]
+
+    # 2. Lọc bỏ số rác, footnote hoặc số trang ở cuối dòng (ví dụ CSC bị dính số 3 hoặc 2 ở cuối dòng đẩy lệch năm)
+    if len(numeric_vals) > 2:
+        if 0 < abs(numeric_vals[-1]) < 100 and any(abs(v) >= 1000000 for v in numeric_vals[:-1]):
+            numeric_vals = numeric_vals[:-1]
 
     return numeric_vals
 
@@ -1668,13 +2048,47 @@ def parse_bctc_excel(file_bytes):
     """
     Đọc tất cả các sheet trong file Excel, nhận diện loại báo cáo theo từng sheet,
     trích xuất chính xác các giá trị số từ mã chỉ tiêu kế toán chuẩn hoặc đối sánh mờ tên nhãn chỉ tiêu.
+    Hỗ trợ đa định dạng: .xlsx (openpyxl), .xls (xlrd), và file HTML table xuất khẩu từ web giả dạng .xls.
     """
-    xls = pd.ExcelFile(io.BytesIO(file_bytes))
+    sheet_dfs = {}
+    
+    # 1. Thử mở dạng Excel chuẩn (.xlsx hoặc .xls)
+    try:
+        xls = pd.ExcelFile(io.BytesIO(file_bytes))
+        for sheet_name in xls.sheet_names:
+            sheet_dfs[sheet_name] = pd.read_excel(xls, sheet_name=sheet_name)
+    except Exception:
+        # 2. Fallback sang xlrd engine nếu là .xls chuẩn cũ
+        try:
+            import xlrd
+            wb = xlrd.open_workbook(file_contents=file_bytes)
+            for sname in wb.sheet_names():
+                sheet_dfs[sname] = pd.read_excel(io.BytesIO(file_bytes), sheet_name=sname, engine="xlrd")
+        except Exception:
+            # 3. Fallback sang HTML Table parser nếu file .xls thực chất là file HTML do web tài chính xuất khẩu
+            try:
+                html_tables = pd.read_html(io.BytesIO(file_bytes))
+                for idx, df_tab in enumerate(html_tables):
+                    sheet_dfs[f"Báo cáo_{idx+1}"] = df_tab
+            except Exception:
+                pass
+
     extracted_data = {}
     
     # Duyệt qua từng sheet trong file
-    for sheet_name in xls.sheet_names:
-        df = pd.read_excel(xls, sheet_name=sheet_name)
+    for sheet_name, df in sheet_dfs.items():
+        if df is None or df.empty:
+            continue
+            
+        # Tự động định vị dòng tiêu đề nếu header nằm ở các dòng bên dưới (do các dòng đầu ghi tên cty, đơn vị tính)
+        if not any(re.search(r'\b(20[1-2]\d)\b', str(c)) for c in df.columns):
+            for r_idx in range(min(12, len(df))):
+                row_vals = [str(x) for x in df.iloc[r_idx].dropna().tolist()]
+                row_str = " ".join(row_vals)
+                if re.search(r'\b(20[1-2]\d)\b', row_str) and any(k in row_str.lower() for k in ["mã", "chỉ tiêu", "thuyết minh", "năm", "kỳ"]):
+                    df.columns = df.iloc[r_idx]
+                    df = df.iloc[r_idx + 1:].reset_index(drop=True)
+                    break
         
         # Nhận diện loại báo cáo dựa trên tên sheet
         statement = detect_statement_type(sheet_name)
@@ -1798,19 +2212,59 @@ def parse_bctc_pdf(file_bytes, filename=""):
     - Nhận diện các năm có trong báo cáo.
     - Duyệt từng trang, phân loại báo cáo (CDKT, KQKD, LCTT).
     - Quét dòng văn bản, tìm mã chỉ tiêu Thông tư 200 và ánh xạ chính xác cột số vào các năm tương ứng.
+    - Tự động phục hồi cấu trúc PDF (Auto-Repair) bằng PyMuPDF nếu gặp lỗi trailer hoặc mất đối tượng gốc (/Root).
     """
+    if not file_bytes or len(file_bytes) < 64:
+        return {"_error_type": "PDF_CORRUPTED", "_filename": filename, "_error_msg": f"File '{filename}' rỗng hoặc không có dữ liệu."}
+        
     extracted_data = {}
-    pdf_file = io.BytesIO(file_bytes)
+    working_bytes = file_bytes
+    all_text = ""
+    pages_texts = []
     
     # 1. Đọc lướt toàn bộ PDF để định vị các năm tài chính xuất hiện
-    all_text = ""
-    with pdfplumber.open(pdf_file) as pdf:
-        for page in pdf.pages:
-            all_text += page.extract_text() or ""
+    try:
+        pdf_file = io.BytesIO(working_bytes)
+        with pdfplumber.open(pdf_file) as pdf:
+            for page in pdf.pages:
+                p_text = page.extract_text() or ""
+                pages_texts.append(p_text)
+                all_text += p_text
+    except Exception as e_pdf:
+        # Cơ chế Auto-Repair: Khôi phục cấu trúc PDF bằng PyMuPDF nếu pdfplumber gặp lỗi (như No /Root object)
+        try:
+            import fitz
+            doc = fitz.open(stream=working_bytes, filetype="pdf")
+            repaired_bytes = doc.tobytes()
+            # Thử lại với pdfplumber trên dữ liệu đã phục hồi
+            try:
+                pdf_file_repaired = io.BytesIO(repaired_bytes)
+                pages_texts = []
+                all_text = ""
+                with pdfplumber.open(pdf_file_repaired) as pdf:
+                    for page in pdf.pages:
+                        p_text = page.extract_text() or ""
+                        pages_texts.append(p_text)
+                        all_text += p_text
+                working_bytes = repaired_bytes
+            except Exception:
+                # Nếu pdfplumber vẫn không thể mở, trích xuất text trực tiếp từ PyMuPDF
+                pages_texts = []
+                all_text = ""
+                for page in doc:
+                    p_text = page.get_text() or ""
+                    pages_texts.append(p_text)
+                    all_text += p_text
+        except Exception as e_fitz:
+            return {
+                "_error_type": "PDF_CORRUPTED",
+                "_filename": filename,
+                "_error_msg": f"File '{filename}' bị lỗi cấu trúc hoặc quá trình tải lên bị gián đoạn giữa chừng ({type(e_pdf).__name__})."
+            }
             
     # Kiểm tra xem PDF có phải là dạng quét ảnh không (không có văn bản)
     if not all_text.strip():
-        return parse_bctc_pdf_ocr(file_bytes, filename)
+        return parse_bctc_pdf_ocr(working_bytes, filename)
             
     # Xác định năm báo cáo Y từ tên file hoặc nội dung
     Y = None
@@ -1840,70 +2294,79 @@ def parse_bctc_pdf(file_bytes, filename=""):
     for y in ordered_years:
         extracted_data[y] = {}
         
-    # 2. Quét chi tiết từng trang
-    pdf_file.seek(0)
-    with pdfplumber.open(pdf_file) as pdf:
-        for page in pdf.pages:
-            text = page.extract_text() or ""
-            statement = detect_statement_type(text)
+    # 2. Quét chi tiết từng trang dựa trên text đã trích xuất
+    for text in pages_texts:
+        statement = detect_statement_type(text)
+        
+        if not statement:
+            continue # Bỏ qua trang thuyết minh hoặc phụ lục không chứa báo cáo chính
             
-            if not statement:
-                continue # Bỏ qua trang thuyết minh hoặc phụ lục không chứa báo cáo chính
+        lines = text.split("\n")
+        for line_idx, line in enumerate(lines):
+            line = clean_bctc_line(line)
+            tokens = line.split()
+            if not tokens:
+                continue
                 
-            lines = text.split("\n")
-            for line_idx, line in enumerate(lines):
-                line = clean_bctc_line(line)
-                tokens = line.split()
-                if not tokens:
+            # Nhận diện mã chỉ tiêu: Lấy số hiệu kế toán đầu tiên xuất hiện trên dòng (<= 500)
+            code_token = None
+            for idx, tok in enumerate(tokens[:6]):
+                if re.match(r'^\d+\.$', tok.strip()):
                     continue
+                tok_clean = tok.strip().replace(".", "").replace(",", "").lower()
+                ocr_code_corrections = {
+                    'iar': '131', '13i': '131', 'i31': '131', '13l': '131', 'iai': '131',
+                    '3io': '310', '31o': '310', 's10': '310',
+                    's00': '300', '3oo': '300',
+                    '27o': '270', 'zoo': '270',
+                    '4oo': '400', '40o': '400',
+                    '42i': '421', '4zi': '421',
+                    'i00': '100', '10o': '100',
+                    'i10': '110', '1io': '110',
+                    'i40': '140', '14o': '140',
+                    '32o': '320', 's20': '320',
+                }
+                if tok_clean in ocr_code_corrections:
+                    tok_clean = ocr_code_corrections[tok_clean]
+                if re.match(r'^\d+[ab]?$', tok_clean):
+                    try:
+                        num_val = int(re.sub(r'[ab]', '', tok_clean))
+                        if num_val <= 500:
+                            code_token = tok_clean
+                            break
+                    except ValueError:
+                        pass
                     
-                # Nhận diện mã chỉ tiêu: Lấy số hiệu kế toán đầu tiên xuất hiện trên dòng (<= 500)
-                code_token = None
-                for idx, tok in enumerate(tokens):
-                    if idx == 0 and re.match(r'^\d+\.$', tok.strip()):
-                        continue
-                    tok_clean = tok.strip().replace(".", "").replace(",", "")
-                    if re.match(r'^\d+[ab]?$', tok_clean):
-                        try:
-                            num_val = int(re.sub(r'[ab]', '', tok_clean))
-                            if num_val <= 500:
-                                code_token = tok_clean
-                                break
-                        except ValueError:
-                            pass
-                        
-                target_var = match_line_to_var_sf(line, code_token, statement)
-                if target_var:
-                    numeric_vals = extract_numbers_from_tokens(tokens, code_token)
-                    
-                    # Xử lý xuống dòng (Split Line): Nếu thiếu số, quét dòng tiếp theo nếu không bắt đầu bằng mã mới
-                    if len(numeric_vals) < len(ordered_years) and line_idx + 1 < len(lines):
-                        next_line = clean_bctc_line(lines[line_idx + 1])
-                        next_tokens = next_line.split()
-                        next_code_token = None
-                        if next_tokens:
-                            for tok in next_tokens[:3]:
-                                tok_clean = tok.strip().replace(".", "").replace(",", "")
-                                if re.match(r'^\d+[ab]?$', tok_clean):
-                                    next_code_token = tok_clean
-                                    break
-                        if not next_code_token:
-                            next_numeric_vals = extract_numbers_from_tokens(next_tokens, None)
-                            if len(next_numeric_vals) >= len(ordered_years):
-                                numeric_vals = next_numeric_vals
+            target_var = match_line_to_var_sf(line, code_token, statement)
+            if target_var:
+                numeric_vals = extract_numbers_from_tokens(tokens, code_token)
+                
+                # Xử lý xuống dòng (Split Line): Nếu thiếu số, quét dòng tiếp theo nếu không bắt đầu bằng mã mới
+                if len(numeric_vals) < len(ordered_years) and line_idx + 1 < len(lines):
+                    next_line = clean_bctc_line(lines[line_idx + 1])
+                    next_tokens = next_line.split()
+                    next_numeric_vals = extract_numbers_from_tokens(next_tokens, None)
+                    if len(next_numeric_vals) >= len(ordered_years) and any(abs(v) >= 1000000 or v == 0 for v in next_numeric_vals):
+                        next_var = match_line_to_var_sf(next_line, None, statement)
+                        if not next_var or next_var == target_var:
+                            numeric_vals = next_numeric_vals
+                            
+                # Lọc số thuyết minh: Chỉ giữ lại N số tài chính cuối cùng tương ứng với số năm
+                numeric_vals = numeric_vals[-len(ordered_years):]
+                
+                if len(numeric_vals) == len(ordered_years):
+                    for idx, val in enumerate(numeric_vals):
+                        target_year = ordered_years[idx]
+                        # Đảm bảo các chỉ tiêu chi phí và tài sản luôn mang giá trị dương
+                        if target_var in ["COGS", "Selling_Expense", "GA_Expense", "Interest_Expense", "Tangible_PPE_Cost", "Total_Assets", "Total_Liabilities", "Current_Liabilities", "Current_Assets", "Fixed_Assets", "Cash_Equivalents", "Inventories", "Current_Receivables", "Accounts_Receivable"]:
+                            val = abs(val)
+                        if target_var == "OCF" and statement == "LCTT":
+                            clean_l = strip_accents(line).lower()
+                            if any(k in clean_l for k in ["su dung vao", "chi cho", "su dung cho"]):
+                                val = -abs(val)
+                        if target_var not in extracted_data[target_year] or extracted_data[target_year][target_var] == 0:
+                            extracted_data[target_year][target_var] = val
                                 
-                    # Lọc số thuyết minh: Chỉ giữ lại N số tài chính cuối cùng tương ứng với số năm
-                    numeric_vals = numeric_vals[-len(ordered_years):]
-                    
-                    if len(numeric_vals) == len(ordered_years):
-                        for idx, val in enumerate(numeric_vals):
-                            target_year = ordered_years[idx]
-                            # Đảm bảo các chỉ tiêu chi phí và tài sản luôn mang giá trị dương
-                            if target_var in ["COGS", "Selling_Expense", "GA_Expense", "Interest_Expense", "Tangible_PPE_Cost", "Total_Assets", "Total_Liabilities", "Current_Liabilities", "Current_Assets", "Fixed_Assets", "Cash_Equivalents", "Inventories", "Current_Receivables", "Accounts_Receivable"]:
-                                val = abs(val)
-                            if target_var not in extracted_data[target_year] or extracted_data[target_year][target_var] == 0:
-                                extracted_data[target_year][target_var] = val
-                                    
     # Tự động suy luận (auto-reconcile) các chỉ tiêu tài chính cơ bản
     extracted_data = reconcile_financial_data(extracted_data)
 
@@ -1912,8 +2375,8 @@ def parse_bctc_pdf(file_bytes, filename=""):
     missing_core = any(y not in extracted_data or "Total_Assets" not in extracted_data[y] or "Equity" not in extracted_data[y] or "Net_Sales" not in extracted_data[y] for y in ordered_years)
     if total_extracted_vars < 16 * len(ordered_years) or missing_core:
         try:
-            ocr_data = parse_bctc_pdf_ocr(file_bytes, filename)
-            if ocr_data:
+            ocr_data = parse_bctc_pdf_ocr(working_bytes, filename)
+            if ocr_data and not ocr_data.get("_error_type"):
                 for y, y_dict in ocr_data.items():
                     if y not in extracted_data:
                         extracted_data[y] = y_dict
@@ -1922,8 +2385,6 @@ def parse_bctc_pdf(file_bytes, filename=""):
                             if k not in extracted_data[y] or extracted_data[y][k] == 0:
                                 extracted_data[y][k] = v
                 extracted_data = reconcile_financial_data(extracted_data)
-        except Exception as e:
-            print(f"OCR fallback error: {e}")
         except Exception as e:
             print(f"OCR fallback error: {e}")
 
@@ -1938,15 +2399,50 @@ def parse_bctc_pdf(file_bytes, filename=""):
 def parse_annual_report_pdf(file_bytes):
     """
     Phân tích văn bản Báo cáo thường niên:
-    - Trích xuất toàn bộ văn bản từ PDF.
+    - Trích xuất toàn bộ văn bản từ PDF (hỗ trợ fallback PyMuPDF).
     - Đếm số từ (ReportLen).
     - Tính tần suất từ khóa rủi ro (RiskWord) và từ tiêu cực (NegTone).
     """
     text = ""
-    pdf_file = io.BytesIO(file_bytes)
-    with pdfplumber.open(pdf_file) as pdf:
-        for page in pdf.pages:
-            text += page.extract_text() or ""
+    try:
+        pdf_file = io.BytesIO(file_bytes)
+        with pdfplumber.open(pdf_file) as pdf:
+            for page in pdf.pages:
+                text += page.extract_text() or ""
+    except Exception:
+        try:
+            import fitz
+            doc = fitz.open(stream=file_bytes, filetype="pdf")
+            for page in doc:
+                text += page.get_text() or ""
+        except Exception:
+            return None
+            
+    if not text.strip():
+        return None
+        
+    words = text.split()
+    total_words = len(words)
+    
+    clean_text = strip_accents(text).lower()
+    
+    # Từ khóa rủi ro tiếng Việt không dấu
+    risk_keywords = ["rui ro", "kho khan", "thach thuc", "suy giam", "bat on", "thua lo", "no xau", "thanh khoan", "vo no", "tai co cau"]
+    risk_word_count = sum(clean_text.count(kw) for kw in risk_keywords)
+    
+    # Từ khóa tiêu cực tiếng Việt không dấu
+    negative_keywords = ["yeu kem", "that bai", "thiet hai", "suy thoai", "tri tre", "cham tre", "bi phat", "kien tung", "tranh chap", "vuong mac", "ton that", "anh huong xau", "tieu cuc"]
+    neg_word_count = sum(clean_text.count(kw) for kw in negative_keywords)
+    
+    # Tỷ lệ tiêu cực: số từ tiêu cực / tổng số từ
+    neg_tone_ratio = (neg_word_count / total_words) if total_words > 0 else 0.0
+    
+    return {
+        "total_words": total_words,
+        "risk_word_count": risk_word_count,
+        "neg_tone_ratio": neg_tone_ratio,
+        "text": text
+    }
             
     if not text.strip():
         return None
@@ -2368,9 +2864,12 @@ def parse_bctc_pdf_ocr(file_bytes, filename):
         if os.path.exists(mac_tesseract):
             pytesseract.pytesseract.tesseract_cmd = mac_tesseract
     
-    pdf_file = io.BytesIO(file_bytes)
-    doc = fitz.open(stream=pdf_file, filetype="pdf")
-    total_pages = len(doc)
+    try:
+        pdf_file = io.BytesIO(file_bytes)
+        doc = fitz.open(stream=pdf_file, filetype="pdf")
+        total_pages = len(doc)
+    except Exception as e:
+        return {"_error_type": "PDF_CORRUPTED", "_filename": filename, "_error_msg": str(e)}
     
     # Chỉ chạy OCR tối đa 25 trang đầu để tối ưu thời gian và bắt trọn vẹn BCTC hợp nhất
     max_pages = min(25, total_pages)
@@ -2443,10 +2942,24 @@ def parse_bctc_pdf_ocr(file_bytes, filename):
                 
             # Nhận diện mã chỉ tiêu: Lấy số hiệu kế toán đầu tiên xuất hiện trên dòng (<= 500)
             code_token = None
-            for idx, tok in enumerate(tokens):
-                if idx == 0 and re.match(r'^\d+\.$', tok.strip()):
+            for idx, tok in enumerate(tokens[:6]):
+                if re.match(r'^\d+\.$', tok.strip()):
                     continue
-                tok_clean = tok.strip().replace(".", "").replace(",", "")
+                tok_clean = tok.strip().replace(".", "").replace(",", "").lower()
+                ocr_code_corrections = {
+                    'iar': '131', '13i': '131', 'i31': '131', '13l': '131', 'iai': '131',
+                    '3io': '310', '31o': '310', 's10': '310',
+                    's00': '300', '3oo': '300',
+                    '27o': '270', 'zoo': '270',
+                    '4oo': '400', '40o': '400',
+                    '42i': '421', '4zi': '421',
+                    'i00': '100', '10o': '100',
+                    'i10': '110', '1io': '110',
+                    'i40': '140', '14o': '140',
+                    '32o': '320', 's20': '320',
+                }
+                if tok_clean in ocr_code_corrections:
+                    tok_clean = ocr_code_corrections[tok_clean]
                 if re.match(r'^\d+[ab]?$', tok_clean):
                     try:
                         num_val = int(re.sub(r'[ab]', '', tok_clean))
@@ -2464,16 +2977,10 @@ def parse_bctc_pdf_ocr(file_bytes, filename):
                 if len(numeric_vals) < len(ordered_years) and line_idx + 1 < len(lines):
                     next_line = clean_bctc_line(lines[line_idx + 1])
                     next_tokens = next_line.split()
-                    next_code_token = None
-                    if next_tokens:
-                        for tok in next_tokens[:3]:
-                            tok_clean = tok.strip().replace(".", "").replace(",", "")
-                            if re.match(r'^\d+[ab]?$', tok_clean):
-                                next_code_token = tok_clean
-                                break
-                    if not next_code_token:
-                        next_numeric_vals = extract_numbers_from_tokens(next_tokens, None)
-                        if len(next_numeric_vals) >= len(ordered_years):
+                    next_numeric_vals = extract_numbers_from_tokens(next_tokens, None)
+                    if len(next_numeric_vals) >= len(ordered_years) and any(abs(v) >= 1000000 or v == 0 for v in next_numeric_vals):
+                        next_var = match_line_to_var_sf(next_line, None, statement)
+                        if not next_var or next_var == target_var:
                             numeric_vals = next_numeric_vals
                             
                 # Lọc số thuyết minh: Chỉ giữ lại N số tài chính cuối cùng tương ứng với số năm
@@ -2485,6 +2992,10 @@ def parse_bctc_pdf_ocr(file_bytes, filename):
                         # Đảm bảo các chỉ tiêu chi phí và tài sản luôn mang giá trị dương
                         if target_var in ["COGS", "Selling_Expense", "GA_Expense", "Interest_Expense", "Tangible_PPE_Cost", "Total_Assets", "Total_Liabilities", "Current_Liabilities", "Current_Assets", "Fixed_Assets", "Cash_Equivalents", "Inventories", "Current_Receivables", "Accounts_Receivable"]:
                             val = abs(val)
+                        if target_var == "OCF" and statement == "LCTT":
+                            clean_l = strip_accents(line).lower()
+                            if any(k in clean_l for k in ["su dung vao", "chi cho", "su dung cho"]):
+                                val = -abs(val)
                         if target_var not in extracted_data[target_year] or extracted_data[target_year][target_var] == 0:
                             extracted_data[target_year][target_var] = val
                                 
@@ -2682,9 +3193,6 @@ def fetch_live_market_parameters(ticker, year, total_assets):
     """
     Tải trực tuyến các tham số EWS nâng cao từ API Vnstock cho năm được chọn.
     """
-    import vnstock.core.utils.env as env
-    env.get_hosting_service = lambda: "Local"
-    from vnstock import Company, Quote, Reference, Finance
     import pandas as pd
     
     # Kết quả mặc định
@@ -2701,6 +3209,10 @@ def fetch_live_market_parameters(ticker, year, total_assets):
         return result
         
     try:
+        import vnstock.core.utils.env as env
+        env.get_hosting_service = lambda: "Local"
+        from vnstock import Company, Quote, Reference, Finance
+        
         # 1. Lấy số CP lưu hành
         comp = Company(symbol=ticker)
         df_ov = comp.overview()
@@ -3406,48 +3918,87 @@ def _find_metadata_in_text(text, default_ticker="N/A"):
     company_name = "N/A"
     ticker = default_ticker
     
+    # 1. Tìm kiếm tên công ty từ chữ ký số (Digital Signature / Chữ ký điện tử) nếu có
+    # Thường xuất hiện trong PDF báo cáo kiểm toán, có độ chính xác pháp lý cao nhất
+    sig_match = re.search(
+        r'(?:Ký\s*bởi|Ky\s*boi|Digitally\s*signed\s*by|CN=)\s*:?\s*(CÔNG\s+TY\s+[^\n\r,;]+|CONG\s+TY\s+[^\n\r,;]+|TẬP\s+ĐOÀN\s+[^\n\r,;]+|TAP\s+DOAN\s+[^\n\r,;]+)',
+        text, re.IGNORECASE
+    )
+    if sig_match:
+        sig_name = sig_match.group(1).strip()
+        sig_name = re.sub(r'^(?:CN=)\s*', '', sig_name, flags=re.IGNORECASE).strip()
+        sig_name = re.split(r'(?:DN:|OID|\bReason\b|\bDate\b|\bSignature\b)', sig_name, flags=re.IGNORECASE)[0].strip()
+        if len(sig_name) >= 10:
+            company_name = sig_name
+
     # Pattern quoc hieu Viet Nam - thuong bi OCR ghep nham vao cung dong ten cong ty
     _STATE_MOTTO_RE = re.compile(
-        r'cong\s*hoa\s*xa\s*hoi|xa\s*hoi\s*chu\s*nghia|doc\s*lap\s*tu\s*do|hanh\s*phuc',
+        r'cong\s*hoa\s*xa\s*hoi|xa\s*hoi\s*chu\s*nghia|doc\s*lap\s*[-–\s]*t[uw]\s*do|doc\s*lap|hanh\s*phuc',
         re.IGNORECASE
     )
     
-    if text.strip():
+    if text.strip() and company_name == "N/A":
         lines_text = text.split('\n')
-        for line in lines_text:
+        for line_idx, line in enumerate(lines_text):
             line_s = strip_accents(line).upper()
             match = re.search(r'\b(CONG\s+TY\s+(?:CO\s+PHAN|TNHH|TRACH\s+NHIEM\s+HUU\s+HAN)|TAP\s+DOAN)\s+([A-Z0-9\s_-]+)', line_s)
             if match:
                 raw_name = line[match.start():].strip() if match.start() > 0 else line.strip()
-                company_name = re.sub(r'^[=\]\[|\~¬\*\-_\/\\:;0-9\s]+', '', raw_name).strip()
-                company_name = re.split(r'(?:Mẫu|Mau|B\s*0)\b', company_name, flags=re.IGNORECASE)[0].strip()
-                company_name = company_name.rstrip('- :|/,')
+                c_cand = re.sub(r'^[=\]\[|\~¬\*\-_\/\\:;0-9\s]+', '', raw_name).strip()
+                c_cand = re.split(r'(?:Mẫu|Mau|B\s*0)\b', c_cand, flags=re.IGNORECASE)[0].strip()
+                c_cand = c_cand.rstrip('- :|/,')
                 
                 # Fix: Cat bo quoc hieu neu OCR ghep nham vao cung dong ten cong ty
-                name_no_accent = strip_accents(company_name).lower()
+                name_no_accent = strip_accents(c_cand).lower()
                 m_state = _STATE_MOTTO_RE.search(name_no_accent)
                 if m_state:
-                    company_name = company_name[:m_state.start()].strip().rstrip('- :|/,')
+                    c_cand = c_cand[:m_state.start()].strip().rstrip('- :|/,')
                 
                 # Neu sau khi cat, ten con qua ngan (chi "Cong Ty Co Phan" khong ten thuc), bo qua
                 remaining = re.sub(
                     r'^(?:cong ty co phan|cong ty tnhh|tap doan|cong ty trach nhiem huu han)\s*',
-                    '', strip_accents(company_name).lower()
+                    '', strip_accents(c_cand).lower()
                 ).strip()
                 if len(remaining) < 3:
-                    company_name = "N/A"
                     continue  # Thu dong tiep theo
                 
-                company_name = re.sub(r'\s+[^a-zA-Z0-9]$', '', company_name)
-                company_name = re.sub(r'\s+[a-zA-Z\u00C0-\u1EF9]$', '', company_name)
-                company_name = company_name.strip()
+                # Nối dòng tiếp theo nếu tên công ty bị ngắt dòng do bố cục văn bản 2 cột
+                # (Ví dụ: dòng 1 "CÔNG TY CỔ PHẦN VẬN TẢI", dòng 2 "ĐA PHƯƠNG THỨC DUYÊN HẢI")
+                rem_words = remaining.split()
+                GENERIC_TAILS = ["van tai", "van tal", "thuong mai", "dau tu", "xay dung", "san xuat", "dich vu", "co phan", "phat trien", "cong nghiep", "nong nghiep", "xuat nhap khau", "tiep van", "logistics"]
+                if (len(rem_words) <= 2 or any(remaining.endswith(t) for t in GENERIC_TAILS)) and line_idx + 1 < len(lines_text):
+                    next_l = lines_text[line_idx + 1].strip()
+                    next_no_accent = strip_accents(next_l).lower()
+                    m_state2 = _STATE_MOTTO_RE.search(next_no_accent)
+                    if m_state2:
+                        next_clean = next_l[:m_state2.start()].strip().rstrip('- :|/,')
+                    else:
+                        next_clean = next_l
+                    if next_clean and not re.search(r'(?:báo\s*cáo|bao\s*cao|mẫu|mau|b\s*0|stt|số|ngày|nguoi|chuc\s*vu)', next_clean, re.IGNORECASE):
+                        if len(next_clean) >= 3 and not re.match(r'^\d+$', next_clean):
+                            c_cand = f"{c_cand} {next_clean}".strip()
+
+                c_cand = re.sub(r'\s+[^a-zA-Z0-9]$', '', c_cand)
+                c_cand = re.sub(r'\s+[a-zA-Z\u00C0-\u1EF9]$', '', c_cand)
+                c_cand = c_cand.strip()
+                company_name = c_cand
                 break
                 
         if ticker == "N/A":
             text_s = strip_accents(text)
-            match = re.search(r'(ma\s+giao\s+dich\s+co\s+phieu\s+la|ma\s+chung\s+khoan|ma\s+giao\s+dich)\s+["\'\u201c]??([A-Z]{3,4})["\'\u201d]??', text_s, re.IGNORECASE)
+            match = re.search(r'(?:ma\s+giao\s+dich\s+co\s+phieu\s+la|ma\s+chung\s+khoan|ma\s+giao\s+dich|ma\s+ck|ma\s+cp|hose|hnx|upcom)\s*[:\s-]\s*["\'\u201c]?([A-Z]{3,4})["\'\u201d]?', text_s, re.IGNORECASE)
             if match:
-                ticker = match.group(2).upper()
+                cand_t = match.group(1).upper()
+                if cand_t in TICKER_NAME_MAP or cand_t in COMPANY_NAME_TO_TICKER_ALIASES or cand_t not in ["BCTC", "VNINDEX", "HNXINDEX", "VN30", "HOSE", "UPCOM"]:
+                    ticker = cand_t
+                    
+        # Nếu vẫn là N/A và đã có company_name, tra cứu theo aliases và TICKER_NAME_MAP
+        if ticker == "N/A" and company_name != "N/A":
+            c_clean = strip_accents(company_name).upper()
+            for kw, t_alias in COMPANY_NAME_TO_TICKER_ALIASES.items():
+                if kw in c_clean:
+                    ticker = t_alias
+                    break
                 
     return company_name, ticker
 
@@ -3460,17 +4011,32 @@ def extract_metadata_from_pdf(file_bytes, filename):
     fn_clean = re.sub(r'[^a-zA-Z0-9\s_-]', '', filename)
     fn_tokens = re.split(r'[\s_.-]', fn_clean)
     for tok in fn_tokens:
-        if len(tok) in [3, 4] and tok.isupper() and tok.isalpha() and tok not in ["BCTC", "PDF", "XLS", "XLSX"]:
+        tok_u = tok.upper()
+        if tok_u in TICKER_NAME_MAP:
+            ticker = tok_u
+            break
+        if tok_u in COMPANY_NAME_TO_TICKER_ALIASES:
+            ticker = COMPANY_NAME_TO_TICKER_ALIASES[tok_u]
+            break
+        if len(tok) in [3, 4] and tok.isupper() and tok.isalpha() and tok not in ["BCTC", "PDF", "XLS", "XLSX", "DATA", "FILE"]:
             ticker = tok
             break
             
-    # 2. Đọc lướt 3 trang đầu tiên bằng pdfplumber
+    # 2. Đọc lướt 3 trang đầu tiên bằng pdfplumber kết hợp PyMuPDF
     first_pages_text = ""
     try:
         pdf_file = io.BytesIO(file_bytes)
         with pdfplumber.open(pdf_file) as pdf:
             for page in pdf.pages[:3]:
                 first_pages_text += page.extract_text() or ""
+    except Exception:
+        pass
+        
+    try:
+        import fitz
+        doc = fitz.open(stream=file_bytes, filetype="pdf")
+        for i in range(min(3, len(doc))):
+            first_pages_text += "\n" + (doc[i].get_text() or "")
     except Exception:
         pass
         
@@ -3516,28 +4082,62 @@ def extract_metadata_from_excel(file_bytes, filename):
     fn_clean = re.sub(r'[^a-zA-Z0-9\s_-]', '', filename)
     fn_tokens = re.split(r'[\s_.-]', fn_clean)
     for tok in fn_tokens:
-        if len(tok) in [3, 4] and tok.isupper() and tok.isalpha() and tok not in ["BCTC", "PDF", "XLS", "XLSX"]:
+        tok_u = tok.upper()
+        if tok_u in TICKER_NAME_MAP:
+            ticker = tok_u
+            break
+        if tok_u in COMPANY_NAME_TO_TICKER_ALIASES:
+            ticker = COMPANY_NAME_TO_TICKER_ALIASES[tok_u]
+            break
+        if len(tok) in [3, 4] and tok.isupper() and tok.isalpha() and tok not in ["BCTC", "PDF", "XLS", "XLSX", "DATA", "FILE"]:
             ticker = tok
             break
             
-    # 2. Tìm tên công ty trong các ô của sheet đầu tiên
+    # Ưu tiên lấy tên chuẩn nếu ticker đã có trong từ điển
+    if ticker in TICKER_NAME_MAP:
+        return TICKER_NAME_MAP[ticker], ticker
+
+    # 2. Tìm tên công ty trong các ô của sheet đầu tiên (hỗ trợ .xlsx, .xls, và HTML table)
+    df_sample = None
     try:
         xls = pd.ExcelFile(io.BytesIO(file_bytes))
-        df = pd.read_excel(xls, sheet_name=xls.sheet_names[0])
-        for r in range(min(20, len(df))):
-            for c in range(min(5, len(df.columns))):
-                val = str(df.iloc[r, c]).strip()
-                val_s = strip_accents(val).upper()
-                if any(p in val_s for p in ["CONG TY CO PHAN", "CONG TY TNHH", "TAP DOAN"]):
-                    company_name = val
-                    company_name = re.split(r'(?:Mẫu|Mau|B\s*0)\b', company_name, flags=re.IGNORECASE)[0].strip()
-                    company_name = company_name.rstrip('- :|/,')
-                    break
-            if company_name != "N/A":
-                break
+        df_sample = pd.read_excel(xls, sheet_name=xls.sheet_names[0])
     except Exception:
-        pass
-        
+        try:
+            import xlrd
+            wb = xlrd.open_workbook(file_contents=file_bytes)
+            df_sample = pd.read_excel(io.BytesIO(file_bytes), sheet_name=wb.sheet_names()[0], engine="xlrd")
+        except Exception:
+            try:
+                html_tables = pd.read_html(io.BytesIO(file_bytes))
+                if html_tables:
+                    df_sample = html_tables[0]
+            except Exception:
+                pass
+
+    if df_sample is not None and not df_sample.empty:
+        try:
+            for r in range(min(20, len(df_sample))):
+                for c in range(min(5, len(df_sample.columns))):
+                    val = str(df_sample.iloc[r, c]).strip()
+                    val_s = strip_accents(val).upper()
+                    if any(p in val_s for p in ["CONG TY CO PHAN", "CONG TY TNHH", "TAP DOAN"]):
+                        company_name = val
+                        company_name = re.split(r'(?:Mẫu|Mau|B\s*0)\b', company_name, flags=re.IGNORECASE)[0].strip()
+                        company_name = company_name.rstrip('- :|/,')
+                        break
+                if company_name != "N/A":
+                    break
+        except Exception:
+            pass
+            
+    if ticker == "N/A" and company_name != "N/A":
+        c_clean = strip_accents(company_name).upper()
+        for kw, t_alias in COMPANY_NAME_TO_TICKER_ALIASES.items():
+            if kw in c_clean:
+                ticker = t_alias
+                break
+
     return clean_company_name(company_name, ticker), ticker
 
 # -------------------------------------------------------------------------
@@ -3696,9 +4296,12 @@ def render_u_curve_workspace():
         # Thêm nút bấm chạy hồi quy
         if st.button("🚀 Chạy hồi quy Panel OLS (U-Curve)"):
             with st.spinner("Đang xử lý dữ liệu, ánh xạ ngành và chạy hồi quy..."):
-                STORAGE_DIR = os.path.join(BASE_DIR, "storage")
+                STORAGE_DIR = get_storage_dir()
                 if not os.path.exists(STORAGE_DIR):
-                    os.makedirs(STORAGE_DIR)
+                    try:
+                        os.makedirs(STORAGE_DIR, exist_ok=True)
+                    except Exception:
+                        pass
                 temp_path = os.path.join(STORAGE_DIR, f"temp_panel_{datetime.datetime.now().timestamp()}.xlsx" if uploaded_panel.name.endswith(('.xlsx', '.xls')) else "temp_panel.csv")
                 with open(temp_path, "wb") as f:
                     f.write(uploaded_panel.read())
@@ -3799,9 +4402,12 @@ if app_mode == "🎛️ Tái ước lượng đòn bẩy (U-Curve)":
 st.sidebar.header("⚙️ Nhập liệu BCTC")
 
 # Thư mục lưu trữ cục bộ để cache hồ sơ doanh nghiệp
-STORAGE_DIR = os.path.join(BASE_DIR, "storage")
+STORAGE_DIR = get_storage_dir()
 if not os.path.exists(STORAGE_DIR):
-    os.makedirs(STORAGE_DIR)
+    try:
+        os.makedirs(STORAGE_DIR, exist_ok=True)
+    except Exception:
+        pass
 
 # Khởi tạo db và thực hiện di cư dữ liệu cũ
 init_db()
@@ -3869,14 +4475,41 @@ if selected_profile != "Tải file mới":
     except Exception as e:
         st.sidebar.error(f"Lỗi nạp dữ liệu SQLite: {e}")
 
-uploaded_files_raw = st.sidebar.file_uploader("Tải lên một hoặc nhiều file BCTC (Excel hoặc PDF)", type=["xlsx", "xls", "pdf"], accept_multiple_files=True)
+uploaded_files_raw = st.sidebar.file_uploader(
+    "Tải lên một hoặc nhiều file BCTC (Excel hoặc PDF)", 
+    type=["xlsx", "xls", "pdf"], 
+    accept_multiple_files=True,
+    help="Hỗ trợ file Excel (.xlsx) và PDF BCTC. Khuyến nghị dung lượng từ 3-5MB/file để tối ưu kết nối Cloud."
+)
 uploaded_files = list(uploaded_files_raw) if uploaded_files_raw else []
 if "uploaded_from_main" in st.session_state and st.session_state["uploaded_from_main"]:
     uploaded_files.extend(st.session_state["uploaded_from_main"])
 
+# Tự động đồng bộ chế độ: Nếu người dùng vừa nạp file mới vào uploader, ưu tiên chuyển về "Tải file mới"
+current_upload_names = sorted([f.name for f in uploaded_files])
+prev_upload_names = st.session_state.get("_prev_upload_names", [])
+
+if current_upload_names and current_upload_names != prev_upload_names:
+    st.session_state["_prev_upload_names"] = current_upload_names
+    if selected_profile != "Tải file mới":
+        st.session_state["active_profile"] = "Tải file mới"
+        st.session_state["sidebar_selected_profile"] = "Tải file mới"
+        st.rerun()
+elif not current_upload_names and prev_upload_names:
+    st.session_state["_prev_upload_names"] = []
+
+# Lưu ý dung lượng file tải lên khuyến nghị
+st.sidebar.info(
+    "💡 **Khuyến nghị tải file (3 – 5 MB):**\n"
+    "Để tránh gián đoạn đường truyền trên Cloud và trích xuất nhanh nhất, nên nạp file dung lượng từ **3 – 5 MB** (hoặc tách riêng các trang Bảng CĐKT, KQKD, LCTT)."
+)
+
 # Hướng dẫn OCR & Lưu ý chất lượng file
 with st.sidebar.expander("ℹ️ Lưu ý chất lượng file & PDF quét ảnh"):
     st.info(
+        "📌 **Lưu ý dung lượng & đường truyền Cloud:**\n"
+        "- **Khuyến nghị dung lượng**: Từ **3 – 5 MB/file**. Khi triển khai trên Streamlit Cloud (máy chủ quốc tế), việc upload cùng lúc nhiều file nặng (> 10MB) dễ bị gián đoạn kết nối WebSocket hoặc timeout.\n"
+        "- **Mẹo tối ưu**: Nén file PDF (qua Smallpdf, iLovePDF) hoặc chỉ trích xuất các trang Báo cáo chính (Bảng CĐKT, KQKD, LCTT - thường từ trang 5 đến 12) trước khi nạp vào hệ thống.\n\n"
         "📌 **Lưu ý về độ chính xác trích xuất:**\n"
         "- **File Excel (.xlsx) / PDF Text (gốc)**: Độ chính xác 100% do đọc trực tiếp số liệu nhúng và mã số kế toán.\n"
         "- **File PDF Scan (ảnh chụp/quét mờ)**: Dữ liệu được nhận diện qua OCR (chính xác ~75–90%). Các trường hợp bị mờ, nghiêng, watermark đè chữ hoặc bảng lệch cột có thể dẫn đến ô **N/A** (thiếu số liệu).\n\n"
@@ -3982,6 +4615,7 @@ with st.sidebar.expander("📝 Tham số Định tính (Báo cáo Thường niê
 extracted_data = {}
 tickers_detected = set()
 company_names_detected = set()
+company_names_by_year = {}
 bank_files_detected = []
 
 if selected_profile != "Tải file mới":
@@ -3995,7 +4629,7 @@ if selected_profile != "Tải file mới":
 elif uploaded_files:
     # Luồng 2: Tải file mới và chạy bộ trích xuất dữ liệu (OCR/Excel)
     for uploaded_file in uploaded_files:
-        file_bytes = uploaded_file.read()
+        file_bytes = uploaded_file.getvalue() if hasattr(uploaded_file, "getvalue") else uploaded_file.read()
         filename = uploaded_file.name
         
         st.sidebar.info(f"📁 Đang xử lý: {filename}")
@@ -4006,44 +4640,67 @@ elif uploaded_files:
             bank_files_detected.append(filename)
             continue # Bỏ qua không trích xuất BCTC ngân hàng thương mại
             
-        # Trích xuất thông tin tóm tắt (Metadata)
-        if filename.endswith(".pdf"):
-            c_name, ticker = extract_metadata_from_pdf(file_bytes, filename)
-        else:
-            c_name, ticker = extract_metadata_from_excel(file_bytes, filename)
-            
-        if ticker != "N/A":
-            tickers_detected.add(ticker)
-        if c_name != "N/A":
-            company_names_detected.add(c_name)
-            
         # Xác định năm báo cáo chính Y của file này để làm độ ưu tiên khi gộp
         fn_years = [int(y) for y in re.findall(r'(20[1-2]\d)', filename)]
         Y_file = max(fn_years) if fn_years else None
         
+        # Trích xuất thông tin tóm tắt (Metadata)
+        try:
+            if filename.endswith(".pdf"):
+                c_name, ticker = extract_metadata_from_pdf(file_bytes, filename)
+            else:
+                c_name, ticker = extract_metadata_from_excel(file_bytes, filename)
+                
+            if ticker != "N/A":
+                tickers_detected.add(ticker)
+            if c_name != "N/A":
+                company_names_detected.add(c_name)
+                if Y_file:
+                    company_names_by_year[Y_file] = c_name
+        except Exception:
+            pass
+        
         # Trích xuất dữ liệu tài chính thô của file này
         with st.spinner(f"Đang trích xuất {filename}..."):
-            if filename.endswith(".pdf"):
-                file_data = parse_bctc_pdf(file_bytes, filename)
-                
-                # FALLBACK TO OCR: Nếu rỗng, hoặc là PDF_SCANNED, hoặc số chỉ tiêu trích xuất được quá ít (< 5) do lỗi font chữ/quét
-                should_run_ocr = False
-                if not file_data or (isinstance(file_data, dict) and file_data.get("_error_type") == "PDF_SCANNED"):
-                    should_run_ocr = True
-                elif isinstance(file_data, dict):
-                    # Đếm số lượng chỉ tiêu thực tế khác nan/0
-                    valid_vars = 0
-                    for y, y_data in file_data.items():
-                        for v, val in y_data.items():
-                            if not v.startswith("_") and val != 0 and not pd.isna(val):
-                                valid_vars += 1
-                    if valid_vars < 5:
-                        should_run_ocr = True
+            try:
+                if filename.endswith(".pdf"):
+                    file_data = parse_bctc_pdf(file_bytes, filename)
+                    
+                    # Kiểm tra file lỗi cấu trúc hoặc bị đứt đoạn khi tải lên
+                    if isinstance(file_data, dict) and file_data.get("_error_type") == "PDF_CORRUPTED":
+                        st.error(f"❌ **Lỗi phân tích file `{filename}`**: {file_data.get('_error_msg')}")
+                        st.warning(
+                            "💡 **Khuyến nghị khắc phục:**\n"
+                            "- File có thể bị lỗi cấu trúc hoặc kết nối tải lên bị gián đoạn (timeout) trên Streamlit Cloud.\n"
+                            "- Khuyến nghị nén file PDF về dung lượng từ **3 – 5 MB** trước khi tải lên (bằng iLovePDF, Smallpdf).\n"
+                            "- Hoặc tách riêng các trang chứa BCTC chính (Bảng CĐKT, KQKD, LCTT) thay vì tải toàn bộ tài liệu thuyết minh."
+                        )
+                        continue
                         
-                if should_run_ocr:
-                    file_data = parse_bctc_pdf_ocr(file_bytes, filename)
-            else:
-                file_data = parse_bctc_excel(file_bytes)
+                    # FALLBACK TO OCR: Nếu rỗng, hoặc là PDF_SCANNED, hoặc số chỉ tiêu trích xuất được quá ít (< 5) do lỗi font chữ/quét
+                    should_run_ocr = False
+                    if not file_data or (isinstance(file_data, dict) and file_data.get("_error_type") == "PDF_SCANNED"):
+                        should_run_ocr = True
+                    elif isinstance(file_data, dict):
+                        # Đếm số lượng chỉ tiêu thực tế khác nan/0
+                        valid_vars = 0
+                        for y, y_data in file_data.items():
+                            for v, val in y_data.items():
+                                if not v.startswith("_") and val != 0 and not pd.isna(val):
+                                    valid_vars += 1
+                        if valid_vars < 5:
+                            should_run_ocr = True
+                            
+                    if should_run_ocr:
+                        file_data = parse_bctc_pdf_ocr(file_bytes, filename)
+                        if isinstance(file_data, dict) and file_data.get("_error_type") == "PDF_CORRUPTED":
+                            st.error(f"❌ **Lỗi OCR file `{filename}`**: {file_data.get('_error_msg')}")
+                            continue
+                else:
+                    file_data = parse_bctc_excel(file_bytes)
+            except Exception as e_proc:
+                st.error(f"❌ Lỗi xử lý file `{filename}`: {e_proc}")
+                continue
                 
         # Gộp dữ liệu của file này vào extracted_data chung (ưu tiên năm báo cáo chính hơn năm so sánh)
         if file_data and not file_data.get("_error_type"):
@@ -4101,10 +4758,36 @@ if extracted_data:
     # 1. Chạy xác thực & tự động hiệu chỉnh cân đối dữ liệu trước
     validation_is_valid, validation_logs = validate_data(extracted_data)
     
-    # 2. Tính toán chỉ số EWS từ dữ liệu đã được hiệu chỉnh
-    main_ticker = list(tickers_detected)[0] if tickers_detected else "N/A"
-    is_listed_val = 1.0 if (len(main_ticker) == 3 and main_ticker.isalpha()) else 0.0
+    # 2. Xác định tên công ty & mã chứng khoán/mã định danh
+    if company_names_by_year:
+        latest_c_year = max(company_names_by_year.keys())
+        summary_company_name = company_names_by_year[latest_c_year]
+    elif company_names_detected:
+        valid_c_names = [n for n in company_names_detected if n and n != "N/A"]
+        if valid_c_names:
+            summary_company_name = max(valid_c_names, key=len)
+        else:
+            summary_company_name = "Không rõ"
+    else:
+        summary_company_name = "Không rõ"
+
+    all_fn = [f.name for f in uploaded_files] if uploaded_files else []
+    main_ticker = resolve_main_ticker(tickers_detected, summary_company_name, all_fn)
     
+    # Đồng bộ lại tên công ty nếu ticker có trong từ điển
+    if main_ticker in TICKER_NAME_MAP and (summary_company_name == "Không rõ" or not summary_company_name):
+        summary_company_name = TICKER_NAME_MAP[main_ticker]
+    elif summary_company_name == "Không rõ" and main_ticker != "DN_MOI":
+        summary_company_name = f"Doanh nghiệp {main_ticker}"
+
+    tickers_detected.add(main_ticker)
+    summary_ticker = main_ticker
+    years_list = sorted(list(extracted_data.keys()))
+    summary_years = ", ".join(map(str, years_list))
+
+    is_listed_val = 1.0 if (len(main_ticker) == 3 and main_ticker.isalpha() and not main_ticker.startswith("DN_")) else 0.0
+
+    # 3. Tính toán chỉ số EWS từ dữ liệu đã được hiệu chỉnh
     ews_results = calculate_ews(
         extracted_data, 
         firm_age=firm_age_input,
@@ -4139,19 +4822,6 @@ if extracted_data:
     # 2c. Tính toán cân đối vốn vay ngắn hạn và bóc tách Phải thu / Tồn kho
     wc_debt_results = calculate_working_capital_and_debt_analysis(extracted_data)
     
-    years_list = sorted(list(extracted_data.keys()))
-    
-    # 3. Hiển thị thông tin tóm tắt hồ sơ doanh nghiệp & kiểm tra chéo
-    
-    main_ticker = list(tickers_detected)[0] if tickers_detected else "N/A"
-    if main_ticker in TICKER_NAME_MAP:
-        summary_company_name = TICKER_NAME_MAP[main_ticker]
-    else:
-        summary_company_name = list(company_names_detected)[0] if company_names_detected else "Không rõ"
-        
-    summary_ticker = ", ".join(tickers_detected) if tickers_detected else "N/A"
-    summary_years = ", ".join(map(str, years_list))
-    
     # Gán các chỉ số định tính và BĐS vào extracted_data để lưu
     for year in years_list:
         extracted_data[year]["Qual_RiskWord"] = risk_words_ratio_input
@@ -4162,43 +4832,147 @@ if extracted_data:
         extracted_data[year]["Qual_CEOAge"] = float(ceo_age_input)
         extracted_data[year]["Qual_Industry"] = str(industry_input)
 
-    # Tự động lưu hồ sơ vào bộ nhớ cache CHỈ LẦN ĐẦU sau khi trích xuất từ file mới
-    # (tránh ghi lại disk mỗi lần rerun/switch tab)
-    _save_flag_key = f"_saved_{main_ticker}"
-    if selected_profile == "Tải file mới" and main_ticker != "N/A" and not st.session_state.get(_save_flag_key):
+    # Tự động lưu hồ sơ vào bộ nhớ SQLite & Cache JSON
+    current_save_sig = f"{main_ticker}_{len(extracted_data)}_{','.join(map(str, sorted(extracted_data.keys())))}"
+    last_saved_sig = st.session_state.get(f"_saved_sig_{main_ticker}")
+
+    if selected_profile == "Tải file mới" and last_saved_sig != current_save_sig:
         profile_to_save = {
             "ticker": main_ticker,
             "company_name": summary_company_name,
             "financial_data": extracted_data
         }
-        cache_path = os.path.join(STORAGE_DIR, f"{main_ticker}.json")
+        cache_path = os.path.join(get_storage_dir(), f"{main_ticker}.json")
         try:
             with open(cache_path, "w", encoding="utf-8") as f:
                 json.dump(profile_to_save, f, ensure_ascii=False, indent=4)
-            st.toast(f"💾 Đã tự động lưu hồ sơ **{main_ticker}** vào cache JSON!", icon="💾")
         except Exception as e:
             st.sidebar.warning(f"Không thể lưu cache JSON: {e}")
             
         try:
             save_to_db(main_ticker, summary_company_name, extracted_data)
-            st.toast(f"🗄️ Đã tự động lưu hồ sơ **{main_ticker}** vào SQLite!", icon="🗄️")
         except Exception as e:
             st.sidebar.warning(f"Không thể lưu vào SQLite: {e}")
         
-        # Đánh dấu đã lưu để các lần rerun sau không ghi lại
-        st.session_state[_save_flag_key] = True
-        # Invalidate cache load_from_db để hồ sơ mới xuất hiện trong danh sách
+        # Đánh dấu signature đã lưu
+        st.session_state[f"_saved_sig_{main_ticker}"] = current_save_sig
+        st.session_state["_just_auto_saved_ticker"] = main_ticker
+        st.session_state["_just_auto_saved_name"] = summary_company_name
+        
+        # Invalidate cache load_from_db để hồ sơ mới xuất hiện trong danh sách selectbox
         load_from_db_cached.clear()
+        if hasattr(get_saved_tickers_from_db, "clear"):
+            try:
+                get_saved_tickers_from_db.clear()
+            except Exception:
+                pass
+                
+        # Rerun một lần duy nhất để thanh selectbox "Chọn hồ sơ đã lưu" ở sidebar cập nhật ngay lập tức
+        st.rerun()
 
-    # Báo cáo Thẩm định EWS (Xuất PDF chuẩn in ấn & Markdown)
+    if st.session_state.get("_just_auto_saved_ticker") == main_ticker:
+        st.sidebar.success(f"💾 **Đã tự động lưu:** {main_ticker}")
+
+    # 4. Mục Lưu hồ sơ thủ công chủ động (Khắc phục phản ánh CSC Slide 23)
+    if selected_profile == "Tải file mới":
+        st.sidebar.markdown("---")
+        st.sidebar.markdown("### 💾 Lưu hồ sơ Doanh nghiệp")
+        st.sidebar.caption("Lưu dữ liệu BCTC đã quét vào hệ thống để tra cứu lại mọi lúc:")
+        col_st1, col_st2 = st.sidebar.columns([1, 2])
+        with col_st1:
+            manual_save_ticker = st.text_input("Mã CK:", value=main_ticker, max_chars=10, key="sb_manual_ticker").upper().strip()
+        with col_st2:
+            def_n = summary_company_name if summary_company_name != "Không rõ" else TICKER_NAME_MAP.get(manual_save_ticker, "")
+            manual_save_name = st.text_input("Tên DN:", value=def_n, key="sb_manual_name").strip()
+            
+        if st.sidebar.button("💾 Lưu hồ sơ công ty này", use_container_width=True, type="primary", key="btn_save_company"):
+            if manual_save_ticker:
+                final_name = manual_save_name if manual_save_name else TICKER_NAME_MAP.get(manual_save_ticker, manual_save_ticker)
+                try:
+                    save_to_db(manual_save_ticker, final_name, extracted_data)
+                    profile_to_save = {
+                        "ticker": manual_save_ticker,
+                        "company_name": final_name,
+                        "financial_data": extracted_data
+                    }
+                    cache_path = os.path.join(get_storage_dir(), f"{manual_save_ticker}.json")
+                    with open(cache_path, "w", encoding="utf-8") as f:
+                        json.dump(profile_to_save, f, ensure_ascii=False, indent=4)
+                    load_from_db_cached.clear()
+                    if hasattr(get_saved_tickers_from_db, "clear"):
+                        try:
+                            get_saved_tickers_from_db.clear()
+                        except Exception:
+                            pass
+                    st.session_state[f"_saved_sig_{manual_save_ticker}"] = f"{manual_save_ticker}_{len(extracted_data)}_{','.join(map(str, sorted(extracted_data.keys())))}"
+                    st.session_state["_just_auto_saved_ticker"] = manual_save_ticker
+                    st.session_state["_just_auto_saved_name"] = final_name
+                    st.session_state["active_profile"] = f"{manual_save_ticker} - {final_name}"
+                    st.session_state["sidebar_selected_profile"] = f"{manual_save_ticker} - {final_name}"
+                    st.sidebar.success(f"✅ Đã lưu thành công hồ sơ **{manual_save_ticker}**!")
+                    st.toast(f"✅ Đã lưu hồ sơ {manual_save_ticker}!", icon="💾")
+                    st.rerun()
+                except Exception as e_save:
+                    st.sidebar.error(f"Lỗi khi lưu: {e_save}")
+            else:
+                st.sidebar.warning("Vui lòng nhập Mã chứng khoán trước khi lưu.")
+
+    # Khởi tạo câu trả lời 5Cs từ session state hoặc DB trước khi sinh Báo cáo
+    user_5c_answers = {}
+    for k_5c, cfg_5c in DEFAULT_5C_CONFIG.items():
+        sess_key = f"5c_{k_5c}"
+        if sess_key in st.session_state:
+            user_5c_answers[k_5c] = st.session_state[sess_key]
+        else:
+            val_from_db = None
+            if latest_y in extracted_data and f"Qual_5C_{k_5c}" in extracted_data[latest_y]:
+                val_from_db = extracted_data[latest_y][f"Qual_5C_{k_5c}"]
+            user_5c_answers[k_5c] = val_from_db if (val_from_db and val_from_db in cfg_5c["options"]) else cfg_5c["default"]
+            st.session_state[sess_key] = user_5c_answers[k_5c]
+
+    res_5cs = calculate_5c_scores(user_5c_answers)
+
+    # Báo cáo Thẩm định EWS & Tờ trình Tín dụng Toàn diện
     if main_ticker != "N/A":
-        from pdf_report_generator import generate_ews_pdf_bytes
+        from pdf_report_generator import generate_ews_pdf_bytes, generate_full_credit_appraisal_pdf_bytes
         
         pdf_bytes = generate_ews_pdf_bytes(
             company_name=summary_company_name,
             ticker=main_ticker,
             extracted_data=extracted_data,
             ews_results=ews_results,
+            firm_age=firm_age_input,
+            tobin_q=tobin_q_input,
+            div_ratio=div_ratio_input,
+            isg=isg_input,
+            ab_return=ab_return_input,
+            unconditional_prob=unconditional_prob_input,
+            industry=industry_input,
+            ceo_age=ceo_age_input,
+            is_bds=is_bds_input
+        )
+        
+        underwriting_dict = {
+            "branch_name": st.session_state.get(f"underwriting_branch_name_{main_ticker}", "Chi nhánh Tân Bình / TP.HCM"),
+            "tax_code": st.session_state.get(f"underwriting_tax_code_{main_ticker}", "0315315451"),
+            "customer_segment": st.session_state.get(f"underwriting_customer_segment_{main_ticker}", "SME (Doanh thu 100 – 1.000 tỷ đồng)"),
+            "industry_full": st.session_state.get(f"underwriting_industry_full_{main_ticker}", f"{industry_input} (Mã ngành: 4632900)"),
+            "internal_grade": st.session_state.get(f"underwriting_internal_grade_{main_ticker}", "Hạng BBB (Đạt chuẩn)"),
+            "credit_purpose": st.session_state.get(f"underwriting_credit_purpose_{main_ticker}", "Cấp tín dụng bổ sung vốn lưu động phục vụ sản xuất kinh doanh và tài trợ thương mại."),
+            "planned_sales": st.session_state.get(f"underwriting_sales_plan_{main_ticker}"),
+            "requested_limit_branch": st.session_state.get(f"underwriting_branch_limit_{main_ticker}", 0.0),
+            "collateral_items": st.session_state.get(f"underwriting_collateral_list_{main_ticker}", [])
+        }
+        
+        pdf_full_memo_bytes = generate_full_credit_appraisal_pdf_bytes(
+            company_name=summary_company_name,
+            ticker=main_ticker,
+            extracted_data=extracted_data,
+            ews_results=ews_results,
+            wc_results=wc_debt_results.get(latest_y) if latest_y else None,
+            qual_results=res_5cs,
+            underwriting_data=underwriting_dict,
+            evaluation_year=latest_y,
             firm_age=firm_age_input,
             tobin_q=tobin_q_input,
             div_ratio=div_ratio_input,
@@ -4224,14 +4998,21 @@ if extracted_data:
         )
         
         st.sidebar.markdown("---")
-        st.sidebar.subheader("📄 Báo cáo Thẩm định EWS")
+        st.sidebar.subheader("📄 Báo cáo Thẩm định Tín dụng")
         st.sidebar.download_button(
-            label="📄 📥 Tải Báo cáo Thẩm định (PDF)",
+            label="🏛️ 📥 Tải Báo cáo Thẩm định Toàn diện (PDF)",
+            data=pdf_full_memo_bytes,
+            file_name=f"Bao_Cao_Tham_Dinh_Toan_Dien_{main_ticker}.pdf",
+            mime="application/pdf",
+            type="primary",
+            help="Tải Báo cáo Thẩm định Tín dụng Đầy đủ chuẩn Ngân hàng Thương mại (Full Underwriting Memo)"
+        )
+        st.sidebar.download_button(
+            label="📊 📥 Tải Báo cáo Tóm tắt EWS (PDF Rút gọn)",
             data=pdf_bytes,
             file_name=f"Bao_Cao_Tham_Dinh_EWS_{main_ticker}.pdf",
             mime="application/pdf",
-            type="primary",
-            help="Tải báo cáo thẩm định rủi ro tín dụng định dạng PDF chuẩn in ấn & trình ký"
+            help="Tải bản tóm tắt Cảnh báo sớm EWS và Bóp méo BCTC (3 trang)"
         )
         
         with st.sidebar.expander("📝 Tùy chọn xuất Markdown thô"):
@@ -4245,15 +5026,24 @@ if extracted_data:
         
         # Tự động lưu bản sao PDF và Markdown vào thư mục storage
         local_pdf_path = os.path.join(STORAGE_DIR, f"Bao_Cao_Tham_Dinh_EWS_{main_ticker}.pdf")
+        local_full_pdf_path = os.path.join(STORAGE_DIR, f"Bao_Cao_Tham_Dinh_Toan_Dien_{main_ticker}.pdf")
         local_md_path = os.path.join(STORAGE_DIR, f"EWS_Summary_{main_ticker}.md")
         try:
             with open(local_pdf_path, "wb") as f:
                 f.write(pdf_bytes)
+            with open(local_full_pdf_path, "wb") as f:
+                f.write(pdf_full_memo_bytes)
             with open(local_md_path, "w", encoding="utf-8") as f:
                 f.write(md_report_content)
         except Exception:
             pass
     
+    if st.session_state.get("_just_auto_saved_ticker") == main_ticker:
+        st.success(
+            f"🎉 **Đã tự động lưu hồ sơ `{main_ticker} - {summary_company_name}` ({summary_years}) vào cơ sở dữ liệu SQLite & Cache!** "
+            f"Dữ liệu đã được lưu trữ vĩnh viễn và đồng bộ vào danh sách **'📂 Chọn hồ sơ đã lưu'** ở thanh bên để bạn xem lại bất cứ lúc nào."
+        )
+
     col_hdr_info, col_hdr_btn = st.columns([4, 1.2])
     with col_hdr_info:
         st.markdown(f"""
@@ -4280,6 +5070,9 @@ if extracted_data:
             st.session_state.pop("active_profile", None)
             st.session_state.pop("uploaded_from_main", None)
             st.session_state.pop("sidebar_selected_profile", None)
+            st.session_state.pop("_prev_upload_names", None)
+            st.session_state.pop("_just_auto_saved_ticker", None)
+            st.session_state.pop("_just_auto_saved_name", None)
             st.rerun()
     
     # Cảnh báo kiểm tra chéo nếu tải lên nhiều mã chứng khoán khác nhau
@@ -4308,18 +5101,19 @@ if extracted_data:
 
     res_5cs = calculate_5c_scores(user_5c_answers)
 
-    # Thiết kế 10 tab nghiệp vụ chuyên sâu theo luồng thẩm định chuẩn mực
-    tab_dashboard, tab_wc_debt, tab_5cs, tab_bank_stmt, tab_controls, tab_components, tab_variables, tab_formulas, tab_validation, tab_audit = st.tabs([
+    # Thiết kế 11 tab nghiệp vụ chuyên sâu theo luồng thẩm định chuẩn mực
+    tab_dashboard, tab_wc_debt, tab_5cs, tab_bank_stmt, tab_underwriting, tab_controls, tab_components, tab_variables, tab_formulas, tab_validation, tab_audit = st.tabs([
         "📊 1. Dashboard Tổng quan & Xếp hạng",
         "⚖️ 2. Cân đối Vốn vay & Chu kỳ tiền mặt (CCC)",
         "🏛️ 3. Đánh giá Định tính 5Cs & Hệ sinh thái",
         "💳 4. Sao kê Dòng tiền & Giám sát Sau Giải ngân",
-        "🛡️ 5. Biến kiểm soát",
-        "📈 6. Chỉ số EWS thành phần",
-        "📋 7. Dữ liệu trích xuất",
-        "🧮 8. Số liệu & Công thức",
-        "🔍 9. Kiểm tra toàn vẹn & Thuế",
-        "🛡️ 10. Truy vết & Chất vấn"
+        "📑 5. Thẩm định Cấp Tín dụng & Hạn mức (Underwriting Memo)",
+        "🛡️ 6. Biến kiểm soát",
+        "📈 7. Chỉ số EWS thành phần",
+        "📋 8. Dữ liệu trích xuất",
+        "🧮 9. Số liệu & Công thức",
+        "🔍 10. Kiểm tra toàn vẹn & Thuế",
+        "🛡️ 11. Truy vết & Chất vấn"
     ])
     
     # ------------------ TAB 1: DASHBOARD TỔNG QUAN ------------------
@@ -4619,7 +5413,25 @@ if extracted_data:
                 "Chu kỳ CCC": f"{y_res['ccc']:.1f} ngày" if y_res['ccc'] is not None else "N/A",
                 "Trạng thái": y_res['zone']
             })
-        st.dataframe(pd.DataFrame(wc_table_rows), width="stretch", hide_index=True)
+        
+        try:
+            wc_col_config = {
+                "Năm": st.column_config.TextColumn(
+                    "Năm",
+                    pinned=True,
+                    width="small",
+                    help="Năm tài chính (Cố định khi lướt ngang)"
+                )
+            }
+        except TypeError:
+            wc_col_config = {
+                "Năm": st.column_config.TextColumn(
+                    "Năm",
+                    width="small",
+                    help="Năm tài chính"
+                )
+            }
+        st.dataframe(pd.DataFrame(wc_table_rows), width="stretch", hide_index=True, column_config=wc_col_config)
         
         col_chart1, col_chart2 = st.columns(2)
         with col_chart1:
@@ -4787,10 +5599,19 @@ if extracted_data:
                         for k, v in updated_answers.items():
                             extracted_data[year][f"Qual_5C_{k}"] = v
                         extracted_data[year]["Qual_5C_TotalScore"] = res_5cs["total_qual_score"]
-                    save_to_db(main_ticker, summary_company_name, extracted_data)
-                    st.success("💾 Đã lưu thành công điểm định tính 5Cs vào cơ sở dữ liệu SQLite!")
-                    st.toast("Đã lưu hồ sơ định tính 5Cs!", icon="🗄️")
-                    st.rerun()
+                    try:
+                        save_to_db(main_ticker, summary_company_name, extracted_data)
+                        load_from_db_cached.clear()
+                        if hasattr(get_saved_tickers_from_db, "clear"):
+                            try:
+                                get_saved_tickers_from_db.clear()
+                            except Exception:
+                                pass
+                        st.success("💾 Đã lưu thành công điểm định tính 5Cs vào cơ sở dữ liệu SQLite!")
+                        st.toast("Đã lưu hồ sơ định tính 5Cs!", icon="🗄️")
+                        st.rerun()
+                    except Exception as e_save_5c:
+                        st.error(f"❌ Không thể lưu vào cơ sở dữ liệu SQLite: {e_save_5c}")
 
     # ------------------ TAB 4: SAO KÊ DÒNG TIỀN NGÂN HÀNG & GIÁM SÁT SAU GIẢI NGÂN ------------------
     with tab_bank_stmt:
@@ -4801,41 +5622,48 @@ if extracted_data:
         **mục đích sử dụng vốn vay** và **tính đúng ngành nghề kinh doanh**.
         """)
         
-        # 1. Tùy chọn nguồn dữ liệu sao kê
-        col_st_opt1, col_st_opt2 = st.columns([2, 2])
-        with col_st_opt1:
-            data_source_mode = st.radio(
-                "Nguồn dữ liệu sao kê tài khoản:",
-                [f"⚡ Sử dụng Sao kê Mẫu Thực tế của {main_ticker} (12 tháng)", "📂 Tải tệp Sao kê Ngân hàng (Excel / CSV)"],
-                index=0,
-                key="bank_stmt_data_source_radio"
+        # 1. Tải tệp sao kê tài khoản thực tế
+        col_st_up1, col_st_up2 = st.columns([3, 2])
+        with col_st_up1:
+            uploaded_stmt = st.file_uploader(
+                "📂 Tải lên tệp Sao kê Tài khoản Ngân hàng (.xlsx, .xls, .csv):",
+                type=["xlsx", "xls", "csv"],
+                key="bank_stmt_file_uploader",
+                help="Hỗ trợ file sao kê tài khoản ngân hàng của doanh nghiệp định dạng Excel hoặc CSV."
             )
+        with col_st_up2:
+            st.markdown("<div style='height: 28px;'></div>", unsafe_allow_html=True)
+            with st.expander("🧪 Dữ liệu Mẫu (Dành cho thử nghiệm)", expanded=False):
+                use_demo_data = st.checkbox(
+                    f"Nạp dữ liệu sao kê giả lập 12 tháng cho {summary_company_name}",
+                    value=False,
+                    key="use_demo_bank_stmt_chk"
+                )
             
         ann_sales = extracted_data[selected_year].get("Net_Sales", 0.0) if selected_year in extracted_data else 30000e9
         ann_cogs = extracted_data[selected_year].get("COGS", 0.0) if selected_year in extracted_data else 25000e9
         
         df_statement_raw = None
+        is_demo_mode = False
         
-        with col_st_opt2:
-            if "Tải tệp" in data_source_mode:
-                uploaded_stmt = st.file_uploader("Tải lên file Sao kê (.xlsx, .csv)", type=["xlsx", "xls", "csv"], key="bank_stmt_file_uploader")
-                if uploaded_stmt is not None:
-                    try:
-                        if uploaded_stmt.name.endswith(".csv"):
-                            df_statement_raw = pd.read_csv(uploaded_stmt)
-                        else:
-                            df_statement_raw = pd.read_excel(uploaded_stmt)
-                        st.success(f"✅ Đã tải lên {len(df_statement_raw)} dòng giao dịch từ `{uploaded_stmt.name}`!")
-                    except Exception as e:
-                        st.error(f"Lỗi đọc file sao kê: {e}")
-            else:
-                st.info(f"💡 Đang áp dụng bộ dữ liệu sao kê 12 tháng mô phỏng thực tế cho doanh nghiệp **{summary_company_name}** theo quy mô doanh thu BCTC năm {selected_year} ({ann_sales/1e9:,.1f} tỷ VND).")
-                df_statement_raw = generate_mock_bank_statement_data(
-                    ticker=main_ticker,
-                    company_name=summary_company_name,
-                    annual_revenue=ann_sales,
-                    annual_cogs=ann_cogs
-                )
+        if uploaded_stmt is not None:
+            try:
+                if uploaded_stmt.name.endswith(".csv"):
+                    df_statement_raw = pd.read_csv(uploaded_stmt)
+                else:
+                    df_statement_raw = pd.read_excel(uploaded_stmt)
+                st.success(f"✅ Đã tải lên và nạp thành công {len(df_statement_raw)} dòng giao dịch từ `{uploaded_stmt.name}`!")
+            except Exception as e:
+                st.error(f"Lỗi đọc file sao kê: {e}")
+        elif use_demo_data:
+            is_demo_mode = True
+            st.warning(f"🧪 **CHẾ ĐỘ DỮ LIỆU MÔ PHỎNG MINH HỌA (DEMO)**: Đang áp dụng bộ dữ liệu 12 tháng giả lập cho **{summary_company_name}** để minh họa các chỉ số và kịch bản cảnh báo sau giải ngân. Đây **KHÔNG PHẢI** là sao kê tài khoản thực tế của doanh nghiệp.")
+            df_statement_raw = generate_mock_bank_statement_data(
+                ticker=main_ticker,
+                company_name=summary_company_name,
+                annual_revenue=ann_sales,
+                annual_cogs=ann_cogs
+            )
 
         if df_statement_raw is not None and not df_statement_raw.empty:
             stmt_analysis = parse_and_analyze_bank_statement(df_statement_raw, annual_sales_target=ann_sales)
@@ -4951,6 +5779,8 @@ if extracted_data:
             # 5. Bảng Cảnh báo Giao dịch Bất thường & Rủi ro Sau Giải ngân
             st.markdown("---")
             st.markdown("### ⚠️ 4. Danh mục Giao dịch Bất thường & Cảnh báo Sai Mục đích Vay")
+            if is_demo_mode:
+                st.caption("*(💡 Chế độ Demo: Các giao dịch bất thường dưới đây là kịch bản giả lập phục vụ minh họa quy trình kiểm soát mục đích vay & rút vốn)*")
             
             if stmt_analysis['flagged_txns']:
                 st.warning(f"🚨 Phát hiện **{len(stmt_analysis['flagged_txns'])} giao dịch** có dấu hiệu sai mục đích sử dụng vốn vay hoặc chuyển tiền ngoài ngành kinh doanh chính (Tổng giá trị: **{stmt_analysis['flagged_amount']/1e9:,.2f} tỷ VND**).")
@@ -4977,9 +5807,295 @@ if extracted_data:
             with st.expander("🔍 Xem toàn bộ dữ liệu Bảng Sao kê Chi tiết"):
                 st.dataframe(stmt_analysis['raw_df'], width="stretch")
         else:
-            st.warning("Vui lòng chọn hoặc tải lên file dữ liệu sao kê để thực hiện phân tích.")
+            st.info(f"""
+            #### ℹ️ Doanh nghiệp chưa nạp dữ liệu Sao kê Tài khoản Ngân hàng
+            * Hệ thống hiện chỉ có Báo cáo tài chính định kỳ của doanh nghiệp **{summary_company_name}**.
+            * Toàn bộ các thông tin về **Chỉ số dòng tiền vào/ra, Độ đều đặn dòng tiền, Mạng lưới đối tác giao dịch** và **Cảnh báo giao dịch bất thường / sai mục đích vay** được tạm ẩn để đảm bảo tính khách quan và **tránh gây hiểu lầm**.
+            * **Để phân tích thực tế**: Khi khách hàng vay nộp file sao kê tài khoản ngân hàng (.xlsx, .xls, .csv), cán bộ tín dụng chỉ cần tải lên ở khung bên trên để hệ thống tự động bóc tách và phân tích.
+            """)
 
-    # ------------------ TAB 5: BIẾN KIỂM SOÁT BỔ SUNG ------------------
+    # ------------------ TAB 5: THẨM ĐỊNH CẤP TÍN DỤNG & HẠN MỨC (UNDERWRITING MEMO) ------------------
+    with tab_underwriting:
+        st.subheader(f"📑 Tờ trình Thẩm định Tín dụng & Phê duyệt Hạn mức ({main_ticker} - {summary_company_name})")
+        st.info("""
+        💡 **Quy trình Thẩm định Tín dụng Doanh nghiệp Chuẩn Ngân hàng Thương mại (Bank-Grade Credit Underwriting):**
+        * **1. Đề xuất Hạn mức Vốn lưu động:** Tính toán trên cơ sở Chu kỳ tiền mặt (CCC), Vòng quay Vốn lưu động ($T$), Tỷ lệ vốn tự có tham gia và Vốn chiếm dụng nhà cung cấp.
+        * **2. Thẩm định & Định giá TSBĐ (LTV):** Áp dụng tỷ lệ cho vay tối đa (LTV) theo khẩu vị rủi ro và xác định cơ cấu có TSBĐ vs Tín chấp.
+        * **3. Động cơ Sinh Điều kiện Tín dụng Tự động (Smart Covenants):** Tự động kích hoạt các điều kiện tiên quyết và cam kết giám sát dựa trên kết quả EWS (Beneish, Dechow, REM, Altman).
+        * **4. Ma trận Nhận diện Rủi ro & Biện pháp Giảm thiểu:** Tự động điền 5 nhóm rủi ro và khuyến nghị biện pháp chế tài.
+        * **5. Phân cấp Thẩm quyền Phê duyệt:** Tự động xác định cấp phê duyệt (C1, C2, C3, Hội đồng Tín dụng) và ghi nhận ngoại lệ chính sách (Policy Exceptions).
+        """)
+        
+        # 1. THIẾT LẬP THAM SỐ TỜ TRÌNH & HỒ SƠ
+        with st.container(border=True):
+            st.markdown("#### 🏛️ 1. Thông tin Định danh Tờ trình & Đơn vị Thẩm định")
+            col_uw1, col_uw2, col_uw3, col_uw4 = st.columns(4)
+            with col_uw1:
+                uw_branch = st.text_input(
+                    "Chi nhánh Đề xuất (ĐVKD):", 
+                    value=st.session_state.get(f"underwriting_branch_name_{main_ticker}", "Chi nhánh Tân Bình / TP.HCM"),
+                    key=f"uw_branch_input_{main_ticker}"
+                )
+                st.session_state[f"underwriting_branch_name_{main_ticker}"] = uw_branch
+            with col_uw2:
+                uw_mst = st.text_input(
+                    "Mã T24 / Mã số thuế:", 
+                    value=st.session_state.get(f"underwriting_tax_code_{main_ticker}", "0315315451"),
+                    key=f"uw_mst_input_{main_ticker}"
+                )
+                st.session_state[f"underwriting_tax_code_{main_ticker}"] = uw_mst
+            with col_uw3:
+                uw_segment = st.selectbox(
+                    "Phân khúc Khách hàng:", 
+                    ["SME (Doanh thu 100 – 1.000 tỷ)", "SME Siêu nhỏ (< 100 tỷ)", "Doanh nghiệp Lớn / Corporate (> 1.000 tỷ)"],
+                    key=f"uw_seg_select_{main_ticker}"
+                )
+                st.session_state[f"underwriting_customer_segment_{main_ticker}"] = uw_segment
+            with col_uw4:
+                uw_grade = st.selectbox(
+                    "Xếp hạng Tín dụng Nội bộ:", 
+                    ["Hạng AAA (Tối ưu)", "Hạng AA", "Hạng A", "Hạng BBB (Đạt chuẩn)", "Hạng BB (Theo dõi)", "Hạng B (Rủi ro)", "Hạng CCC (Nguy hiểm)"],
+                    index=3,
+                    key=f"uw_grade_select_{main_ticker}"
+                )
+                st.session_state[f"underwriting_internal_grade_{main_ticker}"] = uw_grade
+                
+            col_p1, col_p2, col_p3 = st.columns(3)
+            with col_p1:
+                def_sales = extracted_data[selected_year].get("Net_Sales", 100e9) * 1.15
+                uw_sales_plan = st.number_input(
+                    "Doanh thu thuần năm kế hoạch (VND):",
+                    min_value=1e9,
+                    max_value=1e13,
+                    value=float(st.session_state.get(f"underwriting_sales_plan_{main_ticker}", def_sales)),
+                    step=5e9,
+                    format="%f",
+                    help="Doanh thu kế hoạch của doanh nghiệp dùng để tính quy mô nhu cầu vốn lưu động",
+                    key=f"uw_sales_plan_input_{main_ticker}"
+                )
+                st.session_state[f"underwriting_sales_plan_{main_ticker}"] = uw_sales_plan
+            with col_p2:
+                uw_eq_pct = st.slider(
+                    "Tỷ lệ Vốn tự có tham gia tối thiểu:",
+                    min_value=0.15,
+                    max_value=0.50,
+                    value=0.25,
+                    step=0.05,
+                    format="%d%%",
+                    help="Quy định của NHTM thường yêu cầu vốn tự có tham gia tối thiểu 20-30%",
+                    key=f"uw_eq_pct_slider_{main_ticker}"
+                )
+            with col_p3:
+                wc_temp = cue.calculate_working_capital_need(
+                    extracted_data, selected_year, custom_planned_sales=uw_sales_plan, equity_contribution_pct=uw_eq_pct
+                )
+                uw_branch_limit = st.number_input(
+                    "Hạn mức ĐVKD (Chi nhánh) đề xuất cấp (VND):",
+                    min_value=1e9,
+                    max_value=1e13,
+                    value=float(st.session_state.get(f"underwriting_branch_limit_{main_ticker}", wc_temp["recommended_credit_limit"])),
+                    step=5e9,
+                    format="%f",
+                    help="Hạn mức tín dụng mà Chi nhánh trình lên Khối Thẩm định",
+                    key=f"uw_branch_limit_input_{main_ticker}"
+                )
+                st.session_state[f"underwriting_branch_limit_{main_ticker}"] = uw_branch_limit
+
+        # 2. TÍNH TOÁN NHU CẦU VỐN LƯU ĐỘNG & HẠN MỨC ĐỀ XUẤT
+        st.markdown("---")
+        st.markdown("### 📊 2. Tính toán Nhu cầu Vốn lưu động & Hạn mức Tín dụng (Working Capital Sizing)")
+        
+        wc_uw = cue.calculate_working_capital_need(
+            extracted_data, selected_year, custom_planned_sales=uw_sales_plan, equity_contribution_pct=uw_eq_pct
+        )
+        
+        kpi_wc1, kpi_wc2, kpi_wc3, kpi_wc4 = st.columns(4)
+        with kpi_wc1:
+            st.metric(
+                "Tổng Nhu cầu VLĐ", 
+                f"{wc_uw['total_wc_need']/1e9:,.2f} tỷ", 
+                delta=f"Vòng quay: {wc_uw['wc_turnover']:.2f} vòng",
+                help="Tổng vốn lưu động cần thiết = Doanh thu KH / Vòng quay VLĐ"
+            )
+        with kpi_wc2:
+            st.metric(
+                f"Vốn tự có tham gia ({uw_eq_pct:.0%})", 
+                f"{wc_uw['equity_contribution']/1e9:,.2f} tỷ",
+                help="Phần vốn tự có của DN tự tài trợ theo quy chế tín dụng"
+            )
+        with kpi_wc3:
+            st.metric(
+                "Vốn chiếm dụng NCC", 
+                f"{wc_uw['planned_supplier_credit']/1e9:,.2f} tỷ", 
+                delta=f"DPO: {wc_uw['dpo']:.0f} ngày",
+                help="Vốn tín dụng thương mại chiếm dụng từ người bán"
+            )
+        with kpi_wc4:
+            st.metric(
+                "Hạn mức Thẩm định Đề xuất", 
+                f"{wc_uw['recommended_credit_limit']/1e9:,.2f} tỷ",
+                delta=f"KUNN: {wc_uw['recommended_ku_tenor_months']} tháng",
+                delta_color="normal",
+                help="Hạn mức vay vốn lưu động tối đa được cấp sau khi trừ vốn tự có và chiếm dụng"
+            )
+
+        wc_calc_table = [
+            {"TT": 1, "Chỉ tiêu": "Doanh thu thuần năm kế hoạch", "Giá trị": f"{wc_uw['planned_sales']/1e9:,.2f} tỷ VND", "Thuyết minh": "Dự phóng dựa trên kế hoạch kinh doanh và tăng trưởng lịch sử"},
+            {"TT": 2, "Chỉ tiêu": "Giá vốn hàng bán năm kế hoạch", "Giá trị": f"{wc_uw['planned_cogs']/1e9:,.2f} tỷ VND", "Thuyết minh": f"Tỷ lệ giá vốn kế hoạch: {wc_uw['cogs_ratio']:.1%} doanh thu"},
+            {"TT": 3, "Chỉ tiêu": "Vòng quay Vốn lưu động (T)", "Giá trị": f"{wc_uw['wc_turnover']:.2f} vòng/năm", "Thuyết minh": "Căn cứ vòng quay vốn lưu động bình quân thực tế"},
+            {"TT": 4, "Chỉ tiêu": "Tổng nhu cầu Vốn lưu động (1 / 3)", "Giá trị": f"{wc_uw['total_wc_need']/1e9:,.2f} tỷ VND", "Thuyết minh": "Tổng vốn lưu động cần thiết tài trợ chu kỳ kinh doanh"},
+            {"TT": 5, "Chỉ tiêu": f"Vốn tự có tham gia ({uw_eq_pct:.0%})", "Giá trị": f"{wc_uw['equity_contribution']/1e9:,.2f} tỷ VND", "Thuyết minh": "Vốn tự có tham gia tối thiểu theo khẩu vị rủi ro"},
+            {"TT": 6, "Chỉ tiêu": "Vốn chiếm dụng nhà cung cấp", "Giá trị": f"{wc_uw['planned_supplier_credit']/1e9:,.2f} tỷ VND", "Thuyết minh": f"Căn cứ số ngày phải trả người bán bình quân ({wc_uw['dpo']:.0f} ngày)"},
+            {"TT": 7, "Chỉ tiêu": "Hạn mức Vay VLĐ Tối đa Đề xuất (4 - 5 - 6)", "Giá trị": f"⭐ {wc_uw['recommended_credit_limit']/1e9:,.2f} tỷ VND", "Thuyết minh": f"Thời hạn cho vay tối đa mỗi KUNN: {wc_uw['recommended_ku_tenor_months']} tháng"}
+        ]
+        st.dataframe(pd.DataFrame(wc_calc_table), width="stretch", hide_index=True)
+
+        # 3. THẨM ĐỊNH TÀI SẢN BẢO ĐẢM & TỶ LỆ LTV
+        st.markdown("---")
+        st.markdown("### 🏠 3. Thẩm định Danh mục Tài sản Bảo đảm (Collateral & LTV Evaluation)")
+        
+        collat_key = f"underwriting_collateral_list_{main_ticker}"
+        if collat_key not in st.session_state or not st.session_state[collat_key]:
+            st.session_state[collat_key] = [
+                {
+                    "type": "Bất động sản",
+                    "description": "Căn hộ chung cư cao cấp C2.04 Symphony Midtown, Phường Tân Phú, Quận 7, TP.HCM",
+                    "market_value": uw_branch_limit * 0.90,
+                    "ltv_rate": 0.75
+                },
+                {
+                    "type": "Tiền gửi / STK",
+                    "description": "Hợp đồng tiền gửi / Sổ tiết kiệm cầm cố tại Ngân hàng",
+                    "market_value": uw_branch_limit * 0.35,
+                    "ltv_rate": 0.95
+                }
+            ]
+            
+        collat_eval = cue.evaluate_collaterals(st.session_state[collat_key], uw_branch_limit)
+        
+        c_ts1, c_ts2, c_ts3, c_ts4 = st.columns(4)
+        with c_ts1:
+            st.metric("Tổng Giá trị Định giá TSBĐ", f"{collat_eval['total_market_value']/1e9:,.2f} tỷ", delta=f"Bao phủ: {collat_eval['coverage_ratio']:.1%}")
+        with c_ts2:
+            st.metric("Mức Cho vay Tối đa (LTV)", f"{collat_eval['total_secured_capacity']/1e9:,.2f} tỷ", help="Tổng giá trị cho vay tối đa theo tỷ lệ LTV của từng tài sản")
+        with c_ts3:
+            st.metric("Hạn mức có TSBĐ", f"{collat_eval['secured_facility_amount']/1e9:,.2f} tỷ", delta=f"{collat_eval['secured_ratio']:.1%} tổng hạn mức")
+        with c_ts4:
+            unsec_color = "normal" if collat_eval['unsecured_facility_amount'] == 0 else "inverse"
+            st.metric(
+                "Hạn mức Tín chấp (Không TSBĐ)", 
+                f"{collat_eval['unsecured_facility_amount']/1e9:,.2f} tỷ", 
+                delta=f"{collat_eval['unsecured_ratio']:.1%} tổng hạn mức",
+                delta_color=unsec_color
+            )
+
+        collat_display_rows = []
+        for idx, itm in enumerate(collat_eval["items"]):
+            collat_display_rows.append({
+                "STT": idx + 1,
+                "Loại TSBĐ": itm["type"],
+                "Mô tả Chi tiết & Pháp lý": itm["description"],
+                "Giá trị Định giá": f"{itm['market_value']/1e9:,.2f} tỷ VND",
+                "Tỷ lệ LTV (%)": f"{itm['ltv_rate']:.0%}",
+                "Hạn mức Cho vay Tối đa": f"{itm['secured_capacity']/1e9:,.2f} tỷ VND"
+            })
+        st.dataframe(pd.DataFrame(collat_display_rows), width="stretch", hide_index=True)
+        
+        if not collat_eval["meets_80_secured_rule"]:
+            st.warning(f"⚠️ **CẢNH BÁO CƠ CẤU TSBĐ**: Tỷ lệ TSBĐ độc lập hiện tại ({collat_eval['secured_ratio']:.1%}) < 80% quy chuẩn chuẩn hóa. Hồ sơ phát sinh phần tín chấp ({collat_eval['unsecured_facility_amount']/1e9:,.2f} tỷ) và thuộc thẩm quyền phê duyệt ngoại lệ chính sách C2/C3.")
+        else:
+            st.success(f"✅ Cơ cấu TSBĐ độc lập đạt {collat_eval['secured_ratio']:.1%} >= 80%, tuân thủ khẩu vị rủi ro chuẩn.")
+
+        # 4. ĐỘNG CƠ SINH ĐIỀU KIỆN TÍN DỤNG TỰ ĐỘNG (SMART COVENANTS)
+        st.markdown("---")
+        st.markdown("### 📜 4. Động cơ Sinh Điều kiện Tín dụng Tự động (Smart Credit Covenants Generator)")
+        st.caption("Các điều kiện và cam kết pháp lý được tự động kích hoạt dựa trên kết quả rủi ro EWS & 5Cs:")
+        
+        cov_res = cue.generate_smart_credit_covenants(
+            main_ticker, summary_company_name, selected_year, ews_results[selected_year], wc_uw, res_5cs
+        )
+        
+        tab_cov1, tab_cov2, tab_cov3 = st.tabs([
+            "📌 1. Điều kiện Tiên quyết Trước giải ngân",
+            "📌 2. Điều kiện Quản lý Dòng tiền Sau giải ngân",
+            "📌 3. Cam kết Tài chính Covenants"
+        ])
+        
+        with tab_cov1:
+            pre_df = pd.DataFrame(cov_res["pre_conditions"])
+            st.dataframe(pre_df, width="stretch", hide_index=True)
+        with tab_cov2:
+            post_df = pd.DataFrame(cov_res["post_conditions"])
+            st.dataframe(post_df, width="stretch", hide_index=True)
+        with tab_cov3:
+            fin_cov_df = pd.DataFrame(cov_res["financial_covenants"])
+            st.dataframe(fin_cov_df, width="stretch", hide_index=True)
+
+        # 5. MA TRẬN NHẬN DIỆN RỦI RO & BIỆN PHÁP GIẢM THIỂU
+        st.markdown("---")
+        st.markdown("### 🛡️ 5. Ma trận Nhận diện Rủi ro & Biện pháp Giảm thiểu (Risk Matrix)")
+        risk_mat = cue.build_credit_risk_matrix(ews_results[selected_year], wc_uw, collat_eval, res_5cs)
+        st.dataframe(pd.DataFrame(risk_mat), width="stretch", hide_index=True)
+
+        # 6. PHÂN CẤP THẨM QUYỀN PHÊ DUYỆT & NGOẠI LỆ CHÍNH SÁCH
+        st.markdown("---")
+        st.markdown("### 🏛️ 6. Phân cấp Thẩm quyền Phê duyệt & Bảng Ngoại lệ Chính sách")
+        
+        auth_decision = cue.determine_approval_authority(
+            uw_branch_limit,
+            collat_eval["unsecured_facility_amount"],
+            internal_credit_grade=uw_grade.split()[1] if "Hạng" in uw_grade else "BBB",
+            customer_segment=uw_segment
+        )
+        
+        col_au1, col_au2 = st.columns([1.5, 2.5])
+        with col_au1:
+            st.markdown(f"""
+            <div style="background: #1e293b; color: white; padding: 18px; border-radius: 8px;">
+                <p style="margin: 0; color: #94a3b8; font-size: 0.85em; font-weight: bold;">CẤP THẨM QUYỀN PHÊ DUYỆT</p>
+                <h3 style="margin: 6px 0; color: #38bdf8;">{auth_decision['approval_authority']}</h3>
+                <p style="margin: 0; font-size: 0.85em; color: #cbd5e1;">Xếp hạng TD: <b>{auth_decision['internal_grade']}</b> | Phân khúc: <b>{auth_decision['customer_segment']}</b></p>
+            </div>
+            """, unsafe_allow_html=True)
+        with col_au2:
+            st.info(f"📋 **Cơ sở Phân cấp:** {auth_decision['rationale']}")
+            
+        policy_exp_rows = [
+            {"Nội dung Khác biệt": "Thời hạn cho vay KUNN", "Quy định Chuẩn": "Tối đa 4 tháng/KUNN", "Đề xuất Thực tế": f"Tối đa {wc_uw['recommended_ku_tenor_months']} tháng/KUNN", "Cơ sở Chấp thuận": f"Phù hợp với chu kỳ tiền mặt thực tế ({wc_uw['ccc']:.0f} ngày) của ngành"},
+            {"Nội dung Khác biệt": "Cơ cấu TSBĐ độc lập", "Quy định Chuẩn": "Tối thiểu 80% TSBĐ độc lập", "Đề xuất Thực tế": f"TSBĐ: {collat_eval['secured_ratio']:.0%}, Tín chấp: {collat_eval['unsecured_ratio']:.0%}", "Cơ sở Chấp thuận": "Chấp thuận lộ trình bổ sung TSBĐ trong 30 ngày kể từ ngày giải ngân đầu tiên" if collat_eval["unsecured_facility_amount"] > 0 else "Tuân thủ hoàn toàn"}
+        ]
+        st.dataframe(pd.DataFrame(policy_exp_rows), width="stretch", hide_index=True)
+
+        # 7. TẢI BÁO CÁO THẨM ĐỊNH TÍN DỤNG
+        st.markdown("---")
+        st.markdown("### 📥 7. Xuất Báo cáo Thẩm định Tín dụng Chuẩn Ngân hàng Thương mại")
+        
+        c_dl1, c_dl2 = st.columns(2)
+        with c_dl1:
+            if "pdf_full_memo_bytes" in locals() and pdf_full_memo_bytes:
+                st.download_button(
+                    label="🏛️ 📥 Tải Báo cáo Thẩm định Toàn diện Chuẩn Ngân hàng (PDF Đầy đủ)",
+                    data=pdf_full_memo_bytes,
+                    file_name=f"Bao_Cao_Tham_Dinh_Toan_Dien_{main_ticker}.pdf",
+                    mime="application/pdf",
+                    type="primary",
+                    width="stretch",
+                    key="tab_full_underwriting_download_btn",
+                    help="Tải Báo cáo Thẩm định Tín dụng Đầy đủ chuẩn Ngân hàng Thương mại (Full Underwriting Memo)"
+                )
+        with c_dl2:
+            if "pdf_bytes" in locals() and pdf_bytes:
+                st.download_button(
+                    label="📊 📥 Tải Báo cáo Tóm tắt Cảnh báo sớm EWS (PDF Rút gọn)",
+                    data=pdf_bytes,
+                    file_name=f"Bao_Cao_Tham_Dinh_EWS_{main_ticker}.pdf",
+                    mime="application/pdf",
+                    width="stretch",
+                    key="tab_ews_download_btn",
+                    help="Tải bản tóm tắt Cảnh báo sớm EWS và Bóp méo BCTC (3 trang)"
+                )
+
+    # ------------------ TAB 6: BIẾN KIỂM SOÁT BỔ SUNG ------------------
     with tab_controls:
         st.subheader(f"Hệ thống Biến Kiểm Soát Thẩm Định (Năm {selected_year})")
         st.info("Các biến kiểm soát bổ trợ được phân loại thành 4 mức rủi ro (Mức 1 = an toàn → Mức 4 = rủi ro cao) nhằm tăng cường độ tin cậy của mô hình EWS chính.")
@@ -5024,9 +6140,18 @@ if extracted_data:
                         extracted_data[year]["Qual_CEOAge"] = float(ceo_age_input)
                         extracted_data[year]["Qual_Industry"] = str(industry_input)
                         
-                    save_to_db(main_ticker, summary_company_name, extracted_data)
-                    st.success("💾 Đã lưu thay đổi hồ sơ định tính thành công!")
-                    st.toast("Đã cập nhật SQLite database!", icon="💾")
+                    try:
+                        save_to_db(main_ticker, summary_company_name, extracted_data)
+                        load_from_db_cached.clear()
+                        if hasattr(get_saved_tickers_from_db, "clear"):
+                            try:
+                                get_saved_tickers_from_db.clear()
+                            except Exception:
+                                pass
+                        st.success("💾 Đã lưu thay đổi hồ sơ định tính thành công!")
+                        st.toast("Đã cập nhật SQLite database!", icon="💾")
+                    except Exception as e_save_ctrl:
+                        st.error(f"❌ Không thể lưu vào cơ sở dữ liệu SQLite: {e_save_ctrl}")
                     
         with col_qa2:
             st.markdown("**Bảng điểm rủi ro định tính**")
@@ -5635,27 +6760,35 @@ if extracted_data:
             
         # Khu vực tải Báo cáo Thẩm định PDF ở chân trang
         st.markdown("---")
-        st.subheader("📑 Xuất Báo cáo Thẩm định Tín dụng (PDF)")
-        c_rep1, c_rep2 = st.columns([2, 1])
+        st.subheader("📑 Xuất Báo cáo Thẩm định Tín dụng (PDF Chuẩn Ngân hàng)")
+        c_rep1, c_rep2 = st.columns([1.8, 1.2])
         with c_rep1:
             st.markdown(f"""
-            Báo cáo thẩm định rủi ro toàn diện của **{summary_company_name} ({main_ticker})** đã được biên soạn theo mẫu chuẩn ngân hàng, bao gồm:
-            * Bảng số liệu kế toán 21 chỉ tiêu qua các năm.
-            * Đánh giá 10 bộ chỉ số EWS kèm mã màu vùng rủi ro (*An toàn / Vùng xám / Nguy hiểm*).
-            * Tổng hợp cảnh báo kiệt quệ tài chính, thao túng BCTC và câu hỏi chất vấn.
-            * Khung ký duyệt dành cho Cán bộ Thẩm định và Trưởng bộ phận Quản lý Rủi ro.
+            Hồ sơ thẩm định của **{summary_company_name} ({main_ticker})** đã sẵn sàng để xuất ra 2 phiên bản:
+            * 🏛️ **Báo cáo Thẩm định Toàn diện (Full Underwriting Memo):** Tờ trình chuẩn ngân hàng (Hạn mức, Covenants, 5Cs, BCTC, EWS, TSBĐ, Ma trận Rủi ro & Khung Ký duyệt 3 bên).
+            * 📊 **Báo cáo Tóm tắt Cảnh báo sớm EWS:** Bản chẩn đoán nhanh 10 chỉ số EWS định lượng và bóp méo BCTC (3 trang in ấn).
             """)
         with c_rep2:
+            if "pdf_full_memo_bytes" in locals() and pdf_full_memo_bytes:
+                st.download_button(
+                    label="🏛️ 📥 Tải Báo cáo Thẩm định Toàn diện (PDF)",
+                    data=pdf_full_memo_bytes,
+                    file_name=f"Bao_Cao_Tham_Dinh_Toan_Dien_{main_ticker}.pdf",
+                    mime="application/pdf",
+                    type="primary",
+                    width="stretch",
+                    key="main_full_pdf_download_btn",
+                    help="Tải báo cáo thẩm định tín dụng đầy đủ chuẩn ngân hàng thương mại để trình ký phê duyệt"
+                )
             if "pdf_bytes" in locals() and pdf_bytes:
                 st.download_button(
-                    label="📄 📥 Tải Báo cáo Thẩm định (PDF)",
+                    label="📊 📥 Tải Báo cáo Tóm tắt EWS (PDF Rút gọn)",
                     data=pdf_bytes,
                     file_name=f"Bao_Cao_Tham_Dinh_EWS_{main_ticker}.pdf",
                     mime="application/pdf",
-                    type="primary",
-                    use_container_width=True,
-                    key="main_pdf_download_btn",
-                    help="Tải báo cáo PDF chuẩn in ấn, dễ đọc cho nhân viên và trình ký lãnh đạo"
+                    width="stretch",
+                    key="main_ews_pdf_download_btn",
+                    help="Tải bản tóm tắt Cảnh báo sớm EWS định dạng PDF rút gọn (3 trang)"
                 )
 elif selected_profile != "Tải file mới" or uploaded_files:
     st.warning("⚠️ Chưa có dữ liệu hợp lệ được trích xuất. Vui lòng kiểm tra lại các tệp tải lên (Đảm bảo đó là BCTC của doanh nghiệp thông thường sản xuất/thương mại).")
@@ -5684,8 +6817,9 @@ else:
             type=["xlsx", "xls", "pdf"],
             accept_multiple_files=True,
             key="wiz_main_uploader",
-            help="Tải lên BCTC kiểm toán hoặc BCTC nội bộ"
+            help="Tải lên BCTC kiểm toán hoặc BCTC nội bộ. Khuyến nghị dung lượng từ 3-5MB/file để tối ưu tốc độ."
         )
+        st.caption("⚡ **Khuyến nghị dung lượng:** Nên tải file từ **3 – 5 MB** (hoặc tách riêng các trang BCTC chính) để tránh gián đoạn đường truyền trên Cloud.")
         if wiz_files:
             st.session_state["uploaded_from_main"] = wiz_files
             st.success(f"Đã chọn {len(wiz_files)} tệp BCTC. Nhấn Bắt đầu ở Bước 3 để phân tích!")
@@ -5697,27 +6831,33 @@ else:
         with c_p1:
             if st.button("🏢 Hoa Sen (HSG)", use_container_width=True, help="Ngành Thép - Nguyên vật liệu"):
                 st.session_state["active_profile"] = "HSG - Công ty Cổ phần Tập đoàn Hoa Sen"
+                st.session_state["sidebar_selected_profile"] = "HSG - Công ty Cổ phần Tập đoàn Hoa Sen"
                 st.session_state["wizard_selected_industry"] = "Basic Materials (Nguyên vật liệu)"
                 st.rerun()
             if st.button("🏢 Nam Việt (ANV)", use_container_width=True, help="Ngành Thủy sản - Hàng tiêu dùng"):
                 st.session_state["active_profile"] = "ANV - Công ty Cổ phần Nam Việt"
+                st.session_state["sidebar_selected_profile"] = "ANV - Công ty Cổ phần Nam Việt"
                 st.session_state["wizard_selected_industry"] = "Consumer Goods (Hàng tiêu dùng)"
                 st.rerun()
             if st.button("🏢 Bao bì HT (BBH)", use_container_width=True, help="Ngành Bao bì - Công nghiệp"):
                 st.session_state["active_profile"] = "BBH - A Công Ty Cổ Phần BAO BI HOANG THACH"
+                st.session_state["sidebar_selected_profile"] = "BBH - A Công Ty Cổ Phần BAO BI HOANG THACH"
                 st.session_state["wizard_selected_industry"] = "Industrials (Công nghiệp)"
                 st.rerun()
         with c_p2:
             if st.button("🏢 Alvico (ALV)", use_container_width=True, help="Ngành Xây dựng - Công nghiệp"):
                 st.session_state["active_profile"] = "ALV - Công ty Cổ phần Xây dựng ALVICO"
+                st.session_state["sidebar_selected_profile"] = "ALV - Công ty Cổ phần Xây dựng ALVICO"
                 st.session_state["wizard_selected_industry"] = "Industrials (Công nghiệp)"
                 st.rerun()
             if st.button("🏢 Nông sản SG (AGX)", use_container_width=True, help="Ngành Nông sản - Hàng tiêu dùng"):
                 st.session_state["active_profile"] = "AGX - CÔNG TY CỔ PHẦN THỰC PHẨM NÔNG SẢN XUẤT KHẨU SÀI GÒN"
+                st.session_state["sidebar_selected_profile"] = "AGX - CÔNG TY CỔ PHẦN THỰC PHẨM NÔNG SẢN XUẤT KHẨU SÀI GÒN"
                 st.session_state["wizard_selected_industry"] = "Consumer Goods (Hàng tiêu dùng)"
                 st.rerun()
             if st.button("🏢 Vincom (VRE)", use_container_width=True, help="Ngành BĐS Bán lẻ"):
                 st.session_state["active_profile"] = "VRE - Công ty Cổ phần Vincom Retail"
+                st.session_state["sidebar_selected_profile"] = "VRE - Công ty Cổ phần Vincom Retail"
                 st.session_state["wizard_selected_industry"] = "Industrials (Công nghiệp)"
                 st.rerun()
                 
@@ -5794,6 +6934,9 @@ else:
             if wiz_files:
                 st.session_state["uploaded_from_main"] = wiz_files
                 st.session_state["wizard_selected_industry"] = wiz_ind
+                st.session_state["active_profile"] = "Tải file mới"
+                st.session_state["sidebar_selected_profile"] = "Tải file mới"
+                st.session_state["_prev_upload_names"] = sorted([f.name for f in wiz_files])
                 st.rerun()
             elif "active_profile" in st.session_state and st.session_state["active_profile"] != "Tải file mới":
                 st.session_state["wizard_selected_industry"] = wiz_ind
@@ -5801,5 +6944,6 @@ else:
             else:
                 # Default to HSG demo if nothing selected
                 st.session_state["active_profile"] = "HSG - Công ty Cổ phần Tập đoàn Hoa Sen"
+                st.session_state["sidebar_selected_profile"] = "HSG - Công ty Cổ phần Tập đoàn Hoa Sen"
                 st.session_state["wizard_selected_industry"] = "Basic Materials (Nguyên vật liệu)"
                 st.rerun()
